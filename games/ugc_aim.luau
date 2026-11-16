@@ -161,6 +161,7 @@ local function pickTarget(cam)
         local m = cands[i].model
         local ex = {}
         if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
+        ex[#ex + 1] = cam
         ex[#ex + 1] = m
         local part = visiblePoint(m, camPos, ex)
         if part then
