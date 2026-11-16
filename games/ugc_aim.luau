@@ -40,6 +40,9 @@ local Settings = {
     Lead = true,
     BulletSpeed = 1700,
     LeadCap = 0.6,
+    VehicleWeapons = true,
+    TurretPitchMin = -0.35,
+    TurretPitchMax = 0.45,
 }
 
 local Voxel = ReplicatedStorage:WaitForChild("Voxel", 20)
@@ -52,6 +55,10 @@ end
 
 local Vehicles = ReplicatedStorage:WaitForChild("Vehicles", 20)
 local VehicleLive = Vehicles and Vehicles:WaitForChild("Live", 20)
+local VRemotes = Vehicles and Vehicles:WaitForChild("Remotes", 20)
+local HeliFireR = VRemotes and VRemotes:WaitForChild("HeliFire", 10)
+local HeliDoorFireR = VRemotes and VRemotes:WaitForChild("HeliDoorFire", 10)
+local TankFireR = VRemotes and VRemotes:WaitForChild("TankFire", 10)
 
 local Movement = nil
 pcall(function()
@@ -100,6 +107,7 @@ local entityCache = {}
 local nextScan = 0
 local scanMs = 0
 local vehVel = {}
+local myVeh = nil
 
 local function excludeFor(model, cam)
     local ex = {}
@@ -153,6 +161,29 @@ local function collect()
     local myTeam = LocalPlayer.Team
     local myTeamName = myTeam and myTeam.Name
     local mode = Settings.TargetMode
+
+    myVeh = nil
+    if VehicleLive then
+        local uid = LocalPlayer.UserId
+        for _, cfg in ipairs(VehicleLive:GetChildren()) do
+            local mine = cfg:GetAttribute("S1") == uid
+            if not mine then
+                for i = 2, 5 do
+                    if cfg:GetAttribute("S" .. i) == uid then
+                        mine = true
+                        break
+                    end
+                end
+            end
+            if mine then
+                local pose = cfg:GetAttribute("Pose")
+                if typeof(pose) == "CFrame" then
+                    myVeh = { id = cfg:GetAttribute("Id"), cf = pose, cfg = cfg }
+                end
+                break
+            end
+        end
+    end
 
     if mode ~= "vehicles" then
         for _, p in ipairs(Players:GetPlayers()) do
@@ -256,6 +287,16 @@ local function entityVisible(e, camPos, cam)
         return visiblePoint(e.model, camPos, excludeFor(e.model, cam)) ~= nil
     end
     return posVisible(e.model, e.point, camPos, excludeFor(e.model, cam))
+end
+
+-- Turret convention: yaw from atan2(-x, -z) in hull space, pitch asin of the
+-- vertical component. Matches the tank's own PointToObjectSpace pipeline.
+local function aimAngles(cf, worldPoint)
+    local localDir = cf:VectorToObjectSpace(worldPoint - cf.Position)
+    local flat = math.sqrt(localDir.X * localDir.X + localDir.Z * localDir.Z)
+    local yaw = math.atan2(-localDir.X, -localDir.Z)
+    local pitch = math.atan2(localDir.Y, math.max(flat, 1e-4))
+    return yaw, math.clamp(pitch, Settings.TurretPitchMin, Settings.TurretPitchMax)
 end
 
 local function bestVisible(cam, center, camPos, limit)
@@ -422,6 +463,52 @@ mt.__namecall = newcclosure(function(self, ...)
                 if d.Magnitude > 0.25 then
                     d = d.Unit
                     return oldNamecall(self, origin, d, t, d, cone)
+                end
+            end
+        end
+    end
+
+    -- Vehicle weapon lock: only while seated, only on our own hull id.
+    if Settings.Enabled and Settings.VehicleWeapons and target and myVeh
+        and (self == HeliFireR or self == HeliDoorFireR or self == TankFireR) then
+        local n = select("#", ...)
+        local args = table.pack(...)
+        local id = args[1]
+
+        if id == myVeh.id then
+            if self == HeliFireR then
+                local kind = args[2]
+                local pos = args[3]
+                if (kind == "gun" or kind == "rocket") and typeof(pos) == "Vector3" then
+                    args[3] = target.point
+                    return oldNamecall(self, table.unpack(args, 1, n))
+                end
+            elseif self == TankFireR then
+                local yaw, pitch = args[2], args[3]
+                if typeof(yaw) == "number" and typeof(pitch) == "number" then
+                    local ny, np = aimAngles(myVeh.cf, target.point)
+                    args[2] = ny
+                    args[3] = np
+                    return oldNamecall(self, table.unpack(args, 1, n))
+                end
+            elseif self == HeliDoorFireR then
+                local dir = target.point - myVeh.cf.Position
+                if dir.Magnitude > 0.5 then
+                    dir = dir.Unit
+                    local changed = false
+                    for i = 2, n do
+                        local v = args[i]
+                        if typeof(v) == "Vector3" then
+                            local m = v.Magnitude
+                            if m > 0.9 and m < 1.1 then
+                                args[i] = dir
+                                changed = true
+                            end
+                        end
+                    end
+                    if changed then
+                        return oldNamecall(self, table.unpack(args, 1, n))
+                    end
                 end
             end
         end
@@ -632,14 +719,15 @@ local function drawHud(cam)
     for _, e in ipairs(entityCache) do
         if e.kind == "veh" then vehCount += 1 end
     end
-    hud.Text = ("AIM %s   MODE %s   RUN %s   ESP %s   FOV %d   INF %d   VEH %d")
+    hud.Text = ("AIM %s   MODE %s   RUN %s   ESP %s   FOV %d   INF %d   VEH %d%s")
         :format(Settings.Enabled and "ON" or "OFF",
             Settings.TargetMode:upper(),
             Settings.AutoRun and "ON" or "OFF",
             Settings.ESP and "ON" or "OFF",
             Settings.FOV,
             #entityCache - vehCount,
-            vehCount)
+            vehCount,
+            myVeh and ("   GUN V" .. tostring(myVeh.id)) or "")
     hud.Visible = true
 
     if Settings.Enabled and target then
@@ -732,6 +820,9 @@ S.connect(UserInputService.InputBegan, function(input, processed)
         print("[UgcAim] autorun " .. (Settings.AutoRun and "ON" or "OFF"))
     elseif input.KeyCode == Enum.KeyCode.F5 then
         cycleMode()
+    elseif input.KeyCode == Enum.KeyCode.F6 then
+        Settings.VehicleWeapons = not Settings.VehicleWeapons
+        print("[UgcAim] vehicle weapons " .. (Settings.VehicleWeapons and "ON" or "OFF"))
     end
 end)
 
@@ -766,6 +857,8 @@ getgenv().UgcAimStatus = function()
         maxVehicleDistance = Settings.MaxVehicleDistance,
         mode = Settings.TargetMode,
         lead = Settings.Lead,
+        vehicleWeapons = Settings.VehicleWeapons,
+        inVehicle = myVeh and myVeh.id or nil,
         autoRun = Settings.AutoRun,
         autoSprint = Settings.AutoSprint,
         sprintHeld = Movement and Movement.sprintHeld() or nil,
@@ -784,4 +877,4 @@ getgenv().UgcAimStatus = function()
     }
 end
 
-print("[UgcAim] installed - silent aim, infantry+vehicle lock, ESP, FOV, autorun (F1-F5)")
+print("[UgcAim] installed - gun+vehicle lock, ESP, FOV, autorun (F1-F6)")
