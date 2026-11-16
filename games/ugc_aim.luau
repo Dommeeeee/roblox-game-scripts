@@ -1,4 +1,4 @@
--- Ugc / Voxel War: silent aim, visible-part targeting, FOV circle, ESP.
+-- Ugc / Voxel War: silent aim, visible-part targeting, FOV circle, ESP, auto-run.
 -- Camera is never touched. The shot payload is rewritten at the remote boundary,
 -- and the AimShare look report is steered to the same direction so the server-side
 -- look, shot direction and per-shot look argument stay mutually consistent.
@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -26,9 +27,11 @@ local Settings = {
     ESP = true,
     FOVCircle = true,
     FOV = 140,
-    MaxDistance = 450,
+    MaxDistance = 1000,
     TeamCheck = true,
     Smooth = 24,
+    AutoRun = false,
+    AutoSprint = true,
 }
 
 local Voxel = ReplicatedStorage:WaitForChild("Voxel", 20)
@@ -38,6 +41,11 @@ if not AimShare then
     warn("[UgcAim] Voxel.Remotes.AimShare not found")
     return
 end
+
+local Movement = nil
+pcall(function()
+    Movement = require(Voxel:WaitForChild("Movement", 5))
+end)
 
 local fireSet = {}
 for _, r in ipairs(Remotes:GetChildren()) do
@@ -50,25 +58,25 @@ local Bots = workspace:FindFirstChild("BotRigs")
 
 -- Head is deliberately absent: body first, exposed limb when that is all there is.
 local PART_ORDER = {
-    { name = "UpperTorso", w = 1 },
-    { name = "Torso", w = 1 },
-    { name = "LowerTorso", w = 2 },
-    { name = "LeftUpperArm", w = 3 },
-    { name = "RightUpperArm", w = 3 },
-    { name = "Left Arm", w = 3 },
-    { name = "Right Arm", w = 3 },
-    { name = "LeftLowerArm", w = 4 },
-    { name = "RightLowerArm", w = 4 },
-    { name = "LeftUpperLeg", w = 5 },
-    { name = "RightUpperLeg", w = 5 },
-    { name = "Left Leg", w = 5 },
-    { name = "Right Leg", w = 5 },
-    { name = "LeftLowerLeg", w = 6 },
-    { name = "RightLowerLeg", w = 6 },
-    { name = "LeftFoot", w = 7 },
-    { name = "RightFoot", w = 7 },
-    { name = "LeftHand", w = 8 },
-    { name = "RightHand", w = 8 },
+    { name = "UpperTorso" },
+    { name = "Torso" },
+    { name = "LowerTorso" },
+    { name = "LeftUpperArm" },
+    { name = "RightUpperArm" },
+    { name = "Left Arm" },
+    { name = "Right Arm" },
+    { name = "LeftLowerArm" },
+    { name = "RightLowerArm" },
+    { name = "LeftUpperLeg" },
+    { name = "RightUpperLeg" },
+    { name = "Left Leg" },
+    { name = "Right Leg" },
+    { name = "LeftLowerLeg" },
+    { name = "RightLowerLeg" },
+    { name = "LeftFoot" },
+    { name = "RightFoot" },
+    { name = "LeftHand" },
+    { name = "RightHand" },
 }
 
 local rayParams = RaycastParams.new()
@@ -78,7 +86,8 @@ rayParams.IgnoreWater = true
 local target = nil
 local reportDir = nil
 local enemyCache = {}
-local scanT = 0
+local nextScan = 0
+local scanMs = 0
 
 local function collect()
     local list = {}
@@ -112,23 +121,66 @@ local function collect()
     enemyCache = list
 end
 
+local function excludeFor(model, cam)
+    local ex = {}
+    if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
+    ex[#ex + 1] = cam
+    ex[#ex + 1] = model
+    return ex
+end
+
+local function pointVisible(model, part, camPos, ex)
+    rayParams.FilterDescendantsInstances = ex
+    local hit = workspace:Raycast(camPos, part.Position - camPos, rayParams)
+    return (not hit) or hit.Instance:IsDescendantOf(model)
+end
+
 -- First part in priority order that the camera can actually see. Chest when the
 -- torso is clear; otherwise whatever limb is showing.
-local function visiblePoint(model, camPos, exclude)
-    rayParams.FilterDescendantsInstances = exclude
+local function visiblePoint(model, camPos, ex)
     for _, entry in ipairs(PART_ORDER) do
         local part = model:FindFirstChild(entry.name, true)
-        if part and part:IsA("BasePart") then
-            local hit = workspace:Raycast(camPos, part.Position - camPos, rayParams)
-            if not hit or hit.Instance:IsDescendantOf(model) then
-                return part
-            end
+        if part and part:IsA("BasePart") and pointVisible(model, part, camPos, ex) then
+            return part
         end
     end
     return nil
 end
 
-local function pickTarget(cam)
+local function screenAngle(cam, pos, center)
+    local sp, on = cam:WorldToViewportPoint(pos)
+    if not on or sp.Z <= 0 then return nil end
+    return (Vector2.new(sp.X, sp.Y) - center).Magnitude
+end
+
+local function candidateScore(m, cam, center, camPos)
+    local part = m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+        or m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+    if not part then return nil end
+    local d = screenAngle(cam, part.Position, center)
+    if not d or d > Settings.FOV then return nil end
+    if (part.Position - camPos).Magnitude > Settings.MaxDistance then return nil end
+    return d
+end
+
+local function bestVisible(cam, center, camPos, limit)
+    local cands = {}
+    for _, m in ipairs(enemyCache) do
+        local sc = candidateScore(m, cam, center, camPos)
+        if sc then table.insert(cands, { model = m, score = sc }) end
+    end
+    table.sort(cands, function(a, b) return a.score < b.score end)
+    for i = 1, math.min(#cands, limit) do
+        local m = cands[i].model
+        local part = visiblePoint(m, camPos, excludeFor(m, cam))
+        if part then
+            return m, part, cands[i].score
+        end
+    end
+    return nil
+end
+
+local function updateTarget(cam, now)
     if not Settings.Enabled then
         target = nil
         return
@@ -136,38 +188,28 @@ local function pickTarget(cam)
 
     local center = cam.ViewportSize * 0.5
     local camPos = cam.CFrame.Position
-    local cands = {}
 
-    for _, m in ipairs(enemyCache) do
-        local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-        if root then
-            local sp, on = cam:WorldToViewportPoint(root.Position)
-            if on and sp.Z > 0 then
-                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                if d <= Settings.FOV then
-                    local dist = (root.Position - camPos).Magnitude
-                    if dist <= Settings.MaxDistance then
-                        table.insert(cands, { model = m, score = d })
-                    end
-                end
-            end
+    if target and not (target.model.Parent and target.part.Parent) then
+        target = nil
+    end
+
+    -- Retain the current lock while it stays visible, even after a small drift out
+    -- of the acquisition ring. Stops the reticle hopping between two bodies.
+    if target then
+        local d = screenAngle(cam, target.part.Position, center)
+        if d and d <= Settings.FOV * 1.4
+            and pointVisible(target.model, target.part, camPos, excludeFor(target.model, cam)) then
+            target.point = target.part.Position
+            target.score = d
+            return
         end
     end
 
-    table.sort(cands, function(a, b) return a.score < b.score end)
-
-    target = nil
-    for i = 1, math.min(#cands, 6) do
-        local m = cands[i].model
-        local ex = {}
-        if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
-        ex[#ex + 1] = cam
-        ex[#ex + 1] = m
-        local part = visiblePoint(m, camPos, ex)
-        if part then
-            target = { model = m, part = part, point = part.Position, dist = cands[i].score }
-            return
-        end
+    local m, part, score = bestVisible(cam, center, camPos, 8)
+    if m then
+        target = { model = m, part = part, point = part.Position, score = score }
+    else
+        target = nil
     end
 end
 
@@ -233,12 +275,79 @@ mt.__namecall = newcclosure(function(self, ...)
 end)
 pcall(setreadonly, mt, true)
 
+-- Auto-run: native W through VirtualInputManager plus the movement module's own
+-- sprint toggle, so speed, stance, pose flags and audio all come out legitimate.
+local runHeld = false
+
+local function pressRun()
+    if runHeld or not Settings.AutoRun then return end
+    if UserInputService:GetFocusedTextBox() then return end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.W, false, game)
+    end)
+    runHeld = true
+    if Settings.AutoSprint and Movement then
+        pcall(function()
+            if not Movement.sprintHeld() then Movement.toggleSprint() end
+        end)
+    end
+end
+
+local function releaseRun()
+    if not runHeld then return end
+    runHeld = false
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+    end)
+end
+
+local function manageRun()
+    if not Settings.AutoRun then
+        releaseRun()
+        return
+    end
+    if UserInputService:GetFocusedTextBox() then
+        releaseRun()
+        return
+    end
+    if not runHeld then
+        pressRun()
+    elseif Settings.AutoSprint and Movement then
+        if not Movement.sprintHeld() then
+            pcall(function() Movement.toggleSprint() end)
+        end
+    end
+end
+
 local pool = {}
 local fovCircle = Drawing.new("Circle")
 fovCircle.Thickness = 1
 fovCircle.Filled = false
 fovCircle.Transparency = 0.75
 fovCircle.Visible = false
+
+local hud = Drawing.new("Text")
+hud.Size = 14
+hud.Center = false
+hud.Outline = true
+hud.Font = Drawing.Fonts.UI
+hud.Color = Color3.fromRGB(225, 225, 225)
+hud.Position = Vector2.new(14, 10)
+hud.Visible = false
+
+local lockLabel = Drawing.new("Text")
+lockLabel.Size = 15
+lockLabel.Center = true
+lockLabel.Outline = true
+lockLabel.Font = Drawing.Fonts.UI
+lockLabel.Visible = false
+
+local lockRing = Drawing.new("Circle")
+lockRing.Thickness = 1.5
+lockRing.Filled = false
+lockRing.Transparency = 0.9
+lockRing.Radius = 5
+lockRing.Visible = false
 
 local function hide(entry)
     entry.box.Visible = false
@@ -322,22 +431,62 @@ local function drawFov(cam)
     fovCircle.Visible = Settings.Enabled and Settings.FOVCircle
 end
 
+local function drawHud(cam)
+    local center = cam.ViewportSize * 0.5
+    hud.Text = ("AIM %s   RUN %s   ESP %s   FOV %d   TGT %d")
+        :format(Settings.Enabled and "ON" or "OFF",
+            Settings.AutoRun and "ON" or "OFF",
+            Settings.ESP and "ON" or "OFF",
+            Settings.FOV,
+            #enemyCache)
+    hud.Visible = true
+
+    if Settings.Enabled and target then
+        local sp, on = cam:WorldToViewportPoint(target.point)
+        if on and sp.Z > 0 then
+            lockRing.Position = Vector2.new(sp.X, sp.Y)
+            lockRing.Color = Color3.fromRGB(0, 230, 255)
+            lockRing.Visible = true
+            lockLabel.Position = Vector2.new(center.X, center.Y + Settings.FOV + 22)
+            lockLabel.Text = "LOCK  " .. target.model.Name .. "  [" .. target.part.Name .. "]"
+            lockLabel.Color = Color3.fromRGB(0, 230, 255)
+            lockLabel.Visible = true
+            return
+        end
+    end
+    lockRing.Visible = false
+    if Settings.Enabled then
+        lockLabel.Position = Vector2.new(center.X, center.Y + Settings.FOV + 22)
+        lockLabel.Text = "no lock"
+        lockLabel.Color = Color3.fromRGB(150, 150, 150)
+        lockLabel.Visible = true
+    else
+        lockLabel.Visible = false
+    end
+end
+
 local function step(dt)
     local cam = workspace.CurrentCamera
     if not cam then return end
 
-    scanT += dt
-    if scanT >= 0.05 then
-        scanT = 0
+    local now = os.clock()
+    if now >= nextScan then
+        local t0 = os.clock()
         collect()
-        pickTarget(cam)
-    elseif target and target.model.Parent == nil then
-        target = nil
+        updateTarget(cam, now)
+        scanMs = (os.clock() - t0) * 1000
+        nextScan = now + (target and 0.05 or 0.02)
+    end
+
+    if target then
+        target.point = target.part.Position
     end
 
     updateReport(dt)
+    manageRun()
     drawESP(cam)
     drawFov(cam)
+    drawHud(cam)
 end
 
 task.spawn(function()
@@ -347,6 +496,15 @@ task.spawn(function()
         if not ok then warn("[UgcAim] frame: " .. tostring(err)) end
     end
 end)
+
+local function setAutoRun(on)
+    Settings.AutoRun = on
+    if on then
+        pressRun()
+    else
+        releaseRun()
+    end
+end
 
 S.connect(UserInputService.InputBegan, function(input, processed)
     if processed then return end
@@ -359,10 +517,14 @@ S.connect(UserInputService.InputBegan, function(input, processed)
     elseif input.KeyCode == Enum.KeyCode.F3 then
         Settings.FOVCircle = not Settings.FOVCircle
         print("[UgcAim] fov " .. (Settings.FOVCircle and "ON" or "OFF"))
+    elseif input.KeyCode == Enum.KeyCode.F4 then
+        setAutoRun(not Settings.AutoRun)
+        print("[UgcAim] autorun " .. (Settings.AutoRun and "ON" or "OFF"))
     end
 end)
 
 S.onCleanup(function()
+    releaseRun()
     pcall(setreadonly, mt, false)
     mt.__namecall = oldNamecall
     pcall(setreadonly, mt, true)
@@ -371,9 +533,12 @@ S.onCleanup(function()
         e.label:Remove()
     end
     fovCircle:Remove()
+    hud:Remove()
+    lockLabel:Remove()
+    lockRing:Remove()
 end)
 
-getgenv().UgcAim = { Settings = Settings }
+getgenv().UgcAim = { Settings = Settings, setAutoRun = setAutoRun }
 
 getgenv().UgcAimStatus = function()
     return {
@@ -381,12 +546,18 @@ getgenv().UgcAimStatus = function()
         enabled = Settings.Enabled,
         esp = Settings.ESP,
         fov = Settings.FOV,
+        maxDistance = Settings.MaxDistance,
+        autoRun = Settings.AutoRun,
+        autoSprint = Settings.AutoSprint,
+        sprintHeld = Movement and Movement.sprintHeld() or nil,
+        runHeld = runHeld,
         target = target and target.model.Name or nil,
         part = target and target.part.Name or nil,
         enemies = #enemyCache,
         poolSize = #pool,
+        scanMs = scanMs,
         reportDir = reportDir and tostring(reportDir) or nil,
     }
 end
 
-print("[UgcAim] installed - silent aim, visible-part targeting, ESP, FOV (F1/F2/F3)")
+print("[UgcAim] installed - silent aim, visible-part targeting, ESP, FOV, autorun (F1/F2/F3/F4)")
