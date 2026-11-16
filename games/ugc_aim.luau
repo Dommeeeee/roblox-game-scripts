@@ -136,7 +136,7 @@ local function pickTarget(cam)
 
     local center = cam.ViewportSize * 0.5
     local camPos = cam.CFrame.Position
-    local best, bestScore = nil, math.huge
+    local cands = {}
 
     for _, m in ipairs(enemyCache) do
         local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
@@ -144,28 +144,29 @@ local function pickTarget(cam)
             local sp, on = cam:WorldToViewportPoint(root.Position)
             if on and sp.Z > 0 then
                 local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                if d <= Settings.FOV and d < bestScore then
+                if d <= Settings.FOV then
                     local dist = (root.Position - camPos).Magnitude
                     if dist <= Settings.MaxDistance then
-                        bestScore = d
-                        best = m
+                        table.insert(cands, { model = m, score = d })
                     end
                 end
             end
         end
     end
 
-    if not best then
-        target = nil
-        return
-    end
+    table.sort(cands, function(a, b) return a.score < b.score end)
 
-    local ex = { LocalPlayer.Character, best }
-    local part = visiblePoint(best, camPos, ex)
-    if part then
-        target = { model = best, part = part, point = part.Position, dist = bestScore }
-    else
-        target = nil
+    target = nil
+    for i = 1, math.min(#cands, 6) do
+        local m = cands[i].model
+        local ex = {}
+        if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
+        ex[#ex + 1] = m
+        local part = visiblePoint(m, camPos, ex)
+        if part then
+            target = { model = m, part = part, point = part.Position, dist = cands[i].score }
+            return
+        end
     end
 end
 
