@@ -4,7 +4,10 @@
 
 local S = (typeof(STATE) == "table" and STATE) or {
     onCleanup = function() end,
-    connect = function(_, sig, fn) return sig:Connect(fn) end,
+    connect = function(a, b, c)
+        if c ~= nil then return b:Connect(c) end
+        return a:Connect(b)
+    end,
     alive = function() return true end,
 }
 
