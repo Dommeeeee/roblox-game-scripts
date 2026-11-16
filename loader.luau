@@ -34,6 +34,7 @@ local REF  = resolveRef()
 local BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(OWNER, REPO, REF)
 
 local REGISTRY = {
+    { name = "Ugc Voxel War",    place = 78884249003161,  universe = 10773416193, script = "games/ugc_aim.luau" },
     { name = "Hypershot",        place = 17516596118,     universe = 5995470825, script = "games/hypershot_aim.luau" },
     { name = "Raycity RB",       place = 117419079466193, universe = 10772794231, script = "games/raycity_farm.luau" },
     { name = "OJBS",             place = 76870565041704,  universe = nil,           script = "games/ojbs-killaura.lua" },
