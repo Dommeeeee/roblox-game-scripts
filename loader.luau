@@ -17,7 +17,10 @@ local BRANCH = "main"
 -- The /<branch>/ raw path is CDN-cached and can serve stale bytes after a push;
 -- the /<sha>/ path is distinct and always fresh. Falls back to the branch name.
 local function resolveRef()
-    local api = ("https://api.github.com/repos/%s/%s/commits/%s"):format(OWNER, REPO, BRANCH)
+    -- Nonce defeats the client-side HTTP cache; without it the API answer is
+    -- reused for up to a minute and pins the previous commit.
+    local api = ("https://api.github.com/repos/%s/%s/commits/%s?nonce=%d%d"):format(
+        OWNER, REPO, BRANCH, os.time(), math.random(100000, 999999))
     local ok, body = pcall(function() return game:HttpGet(api) end)
     if ok and typeof(body) == "string" then
         local ok2, data = pcall(function()
