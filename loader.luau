@@ -12,7 +12,26 @@ local S = (typeof(STATE) == "table" and STATE) or {
 local OWNER  = "Dommeeeee"
 local REPO   = "roblox-game-scripts"
 local BRANCH = "main"
-local BASE   = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(OWNER, REPO, BRANCH)
+
+-- Resolve the latest commit SHA so fetches pin to an exact, uncached raw path.
+-- The /<branch>/ raw path is CDN-cached and can serve stale bytes after a push;
+-- the /<sha>/ path is distinct and always fresh. Falls back to the branch name.
+local function resolveRef()
+    local api = ("https://api.github.com/repos/%s/%s/commits/%s"):format(OWNER, REPO, BRANCH)
+    local ok, body = pcall(function() return game:HttpGet(api) end)
+    if ok and typeof(body) == "string" then
+        local ok2, data = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(body)
+        end)
+        if ok2 and typeof(data) == "table" and typeof(data.sha) == "string" then
+            return data.sha
+        end
+    end
+    return BRANCH
+end
+
+local REF  = resolveRef()
+local BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(OWNER, REPO, REF)
 
 local REGISTRY = {
     { name = "Hypershot",        place = 17516596118,     universe = 5995470825, script = "games/hypershot_aim.luau" },
@@ -78,6 +97,7 @@ getgenv().GameLoader = {
     resolve = resolve,
     fetch = fetch,
     base = BASE,
+    ref = REF,
     current = entry and entry.name or nil,
     place = placeId,
     universe = universeId,
