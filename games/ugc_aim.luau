@@ -1,7 +1,10 @@
--- Ugc / Voxel War: silent aim, visible-part targeting, FOV circle, ESP, auto-run.
+-- Ugc / Voxel War: silent aim with infantry and vehicle lock, ESP, FOV, auto-run.
 -- Camera is never touched. The shot payload is rewritten at the remote boundary,
 -- and the AimShare look report is steered to the same direction so the server-side
 -- look, shot direction and per-shot look argument stay mutually consistent.
+--
+-- Vehicles are read from ReplicatedStorage.Vehicles.Live: Id, Model, Team, Health,
+-- Wrecked, Pose. The hull model is optional for targeting - pose is always there.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -28,10 +31,15 @@ local Settings = {
     FOVCircle = true,
     FOV = 140,
     MaxDistance = 1000,
+    MaxVehicleDistance = 2500,
     TeamCheck = true,
     Smooth = 24,
     AutoRun = false,
     AutoSprint = true,
+    TargetMode = "both",  -- both | vehicles | infantry
+    Lead = true,
+    BulletSpeed = 1700,
+    LeadCap = 0.6,
 }
 
 local Voxel = ReplicatedStorage:WaitForChild("Voxel", 20)
@@ -41,6 +49,9 @@ if not AimShare then
     warn("[UgcAim] Voxel.Remotes.AimShare not found")
     return
 end
+
+local Vehicles = ReplicatedStorage:WaitForChild("Vehicles", 20)
+local VehicleLive = Vehicles and Vehicles:WaitForChild("Live", 20)
 
 local Movement = nil
 pcall(function()
@@ -85,47 +96,16 @@ rayParams.IgnoreWater = true
 
 local target = nil
 local reportDir = nil
-local enemyCache = {}
+local entityCache = {}
 local nextScan = 0
 local scanMs = 0
-
-local function collect()
-    local list = {}
-    local myTeam = LocalPlayer.Team
-    local myTeamName = myTeam and myTeam.Name
-
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and not (Settings.TeamCheck and myTeam and p.Team == myTeam) then
-            local ch = p.Character
-            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-            if ch and hum and hum.Health > 0 and ch:GetAttribute("Protected") ~= true then
-                table.insert(list, ch)
-            end
-        end
-    end
-
-    if Bots then
-        for _, b in ipairs(Bots:GetChildren()) do
-            if b:IsA("Model")
-                and b:GetAttribute("Alive") ~= false
-                and b:GetAttribute("Protected") ~= true
-                and not (Settings.TeamCheck and myTeamName and b:GetAttribute("Team") == myTeamName) then
-                local hum = b:FindFirstChildOfClass("Humanoid")
-                if hum and hum.Health > 0 then
-                    table.insert(list, b)
-                end
-            end
-        end
-    end
-
-    enemyCache = list
-end
+local vehVel = {}
 
 local function excludeFor(model, cam)
     local ex = {}
     if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
     ex[#ex + 1] = cam
-    ex[#ex + 1] = model
+    if model then ex[#ex + 1] = model end
     return ex
 end
 
@@ -135,8 +115,13 @@ local function pointVisible(model, part, camPos, ex)
     return (not hit) or hit.Instance:IsDescendantOf(model)
 end
 
--- First part in priority order that the camera can actually see. Chest when the
--- torso is clear; otherwise whatever limb is showing.
+local function posVisible(model, pos, camPos, ex)
+    rayParams.FilterDescendantsInstances = ex
+    local hit = workspace:Raycast(camPos, pos - camPos, rayParams)
+    if not hit then return true end
+    return model ~= nil and hit.Instance:IsDescendantOf(model)
+end
+
 local function visiblePoint(model, camPos, ex)
     for _, entry in ipairs(PART_ORDER) do
         local part = model:FindFirstChild(entry.name, true)
@@ -147,37 +132,170 @@ local function visiblePoint(model, camPos, ex)
     return nil
 end
 
+local function chestOf(model)
+    return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        or model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+end
+
+local function vehicleModel(id)
+    local name = "V" .. tostring(id)
+    local hulls = workspace:FindFirstChild("VehicleHulls")
+    local m = hulls and hulls:FindFirstChild(name)
+    if m then return m end
+    local helis = workspace:FindFirstChild("Helicopters")
+    m = helis and helis:FindFirstChild(name)
+    if m then return m end
+    return workspace:FindFirstChild(name)
+end
+
+local function collect()
+    local list = {}
+    local myTeam = LocalPlayer.Team
+    local myTeamName = myTeam and myTeam.Name
+    local mode = Settings.TargetMode
+
+    if mode ~= "vehicles" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and not (Settings.TeamCheck and myTeam and p.Team == myTeam) then
+                local ch = p.Character
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                if ch and hum and hum.Health > 0 and ch:GetAttribute("Protected") ~= true then
+                    table.insert(list, { kind = "inf", model = ch, name = ch.Name })
+                end
+            end
+        end
+
+        if Bots then
+            for _, b in ipairs(Bots:GetChildren()) do
+                if b:IsA("Model")
+                    and b:GetAttribute("Alive") ~= false
+                    and b:GetAttribute("Protected") ~= true
+                    and not (Settings.TeamCheck and myTeamName and b:GetAttribute("Team") == myTeamName) then
+                    local hum = b:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health > 0 then
+                        table.insert(list, { kind = "inf", model = b, name = b.Name })
+                    end
+                end
+            end
+        end
+    end
+
+    if mode ~= "infantry" and VehicleLive then
+        local now = os.clock()
+        for _, cfg in ipairs(VehicleLive:GetChildren()) do
+            local team = cfg:GetAttribute("Team")
+            local health = cfg:GetAttribute("Health")
+            local wrecked = cfg:GetAttribute("Wrecked")
+            local pose = cfg:GetAttribute("Pose")
+            local id = cfg:GetAttribute("Id")
+            if typeof(pose) == "CFrame" and typeof(id) == "number"
+                and wrecked ~= true and typeof(health) == "number" and health > 0
+                and not (Settings.TeamCheck and myTeamName and team == myTeamName) then
+                local pos = pose.Position
+                local rec = vehVel[id]
+                if rec then
+                    local dt = now - rec.t
+                    if dt > 0.01 then
+                        local instant = (pos - rec.p) / dt
+                        rec.v = rec.v:Lerp(instant, 0.35)
+                        rec.p = pos
+                        rec.t = now
+                    end
+                else
+                    rec = { p = pos, t = now, v = Vector3.zero }
+                    vehVel[id] = rec
+                end
+                local model = vehicleModel(id)
+                table.insert(list, {
+                    kind = "veh",
+                    id = id,
+                    model = model,
+                    point = pos,
+                    vel = rec.v,
+                    health = health,
+                    label = tostring(cfg:GetAttribute("Model") or "Vehicle"),
+                })
+            end
+        end
+    end
+
+    entityCache = list
+end
+
 local function screenAngle(cam, pos, center)
     local sp, on = cam:WorldToViewportPoint(pos)
     if not on or sp.Z <= 0 then return nil end
     return (Vector2.new(sp.X, sp.Y) - center).Magnitude
 end
 
-local function candidateScore(m, cam, center, camPos)
-    local part = m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
-        or m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-    if not part then return nil end
-    local d = screenAngle(cam, part.Position, center)
+local function entityPos(e)
+    if e.kind == "inf" then
+        local part = chestOf(e.model)
+        return part and part.Position or nil
+    end
+    return e.point
+end
+
+local function candidateScore(e, cam, center, camPos)
+    local pos = entityPos(e)
+    if not pos then return nil end
+    local d = screenAngle(cam, pos, center)
     if not d or d > Settings.FOV then return nil end
-    if (part.Position - camPos).Magnitude > Settings.MaxDistance then return nil end
+    local limit = e.kind == "veh" and Settings.MaxVehicleDistance or Settings.MaxDistance
+    if (pos - camPos).Magnitude > limit then return nil end
     return d
+end
+
+local function entityKey(e)
+    if e.kind == "veh" then return "V" .. tostring(e.id) end
+    return tostring(e.model)
+end
+
+local function entityVisible(e, camPos, cam)
+    if e.kind == "inf" then
+        return visiblePoint(e.model, camPos, excludeFor(e.model, cam)) ~= nil
+    end
+    return posVisible(e.model, e.point, camPos, excludeFor(e.model, cam))
 end
 
 local function bestVisible(cam, center, camPos, limit)
     local cands = {}
-    for _, m in ipairs(enemyCache) do
-        local sc = candidateScore(m, cam, center, camPos)
-        if sc then table.insert(cands, { model = m, score = sc }) end
+    for _, e in ipairs(entityCache) do
+        local sc = candidateScore(e, cam, center, camPos)
+        if sc then table.insert(cands, { e = e, score = sc }) end
     end
     table.sort(cands, function(a, b) return a.score < b.score end)
     for i = 1, math.min(#cands, limit) do
-        local m = cands[i].model
-        local part = visiblePoint(m, camPos, excludeFor(m, cam))
-        if part then
-            return m, part, cands[i].score
+        local e = cands[i].e
+        if entityVisible(e, camPos, cam) then
+            return e, cands[i].score
         end
     end
     return nil
+end
+
+local function lockFrom(e, score)
+    local t = {
+        key = entityKey(e),
+        kind = e.kind,
+        model = e.model,
+        id = e.id,
+        name = e.name or (e.label and (e.label .. " #" .. tostring(e.id))) or "vehicle",
+        label = e.label,
+        health = e.health,
+        base = e.point,
+        vel = e.vel,
+        score = score,
+        point = e.point,
+    }
+    if e.kind == "inf" then
+        t.part = visiblePoint(e.model, workspace.CurrentCamera.CFrame.Position, excludeFor(e.model, workspace.CurrentCamera))
+            or chestOf(e.model)
+        t.name = e.model.Name
+        t.point = t.part and t.part.Position or Vector3.zero
+        t.base = t.point
+    end
+    return t
 end
 
 local function updateTarget(cam, now)
@@ -189,28 +307,66 @@ local function updateTarget(cam, now)
     local center = cam.ViewportSize * 0.5
     local camPos = cam.CFrame.Position
 
-    if target and not (target.model.Parent and target.part.Parent) then
+    if target then
+        local live = nil
+        for _, e in ipairs(entityCache) do
+            if entityKey(e) == target.key then
+                live = e
+                break
+            end
+        end
+        if live then
+            local pos = entityPos(live)
+            local d = pos and screenAngle(cam, pos, center)
+            if d and d <= Settings.FOV * 1.4 and entityVisible(live, camPos, cam) then
+                target = lockFrom(live, d)
+                return
+            end
+        end
         target = nil
     end
 
-    -- Retain the current lock while it stays visible, even after a small drift out
-    -- of the acquisition ring. Stops the reticle hopping between two bodies.
-    if target then
-        local d = screenAngle(cam, target.part.Position, center)
-        if d and d <= Settings.FOV * 1.4
-            and pointVisible(target.model, target.part, camPos, excludeFor(target.model, cam)) then
-            target.point = target.part.Position
-            target.score = d
+    local e, score = bestVisible(cam, center, camPos, 8)
+    if e then
+        target = lockFrom(e, score)
+    end
+end
+
+local function updateAimPoint(dt)
+    local cam = workspace.CurrentCamera
+    if not cam or not target or not Settings.Enabled then
+        return
+    end
+
+    local base, vel
+    if target.kind == "inf" then
+        if not target.part or not target.part.Parent then return end
+        base = target.part.Position
+        vel = target.part.AssemblyLinearVelocity
+    else
+        local cfg = VehicleLive and VehicleLive:FindFirstChild(target.key)
+        if cfg then
+            local pose = cfg:GetAttribute("Pose")
+            if typeof(pose) == "CFrame" then
+                target.base = pose.Position
+            end
+            target.health = cfg:GetAttribute("Health")
+        end
+        base = target.base
+        vel = target.vel or Vector3.zero
+    end
+
+    if not base then return end
+
+    if Settings.Lead and vel and vel.Magnitude > 1 then
+        local dist = (base - cam.CFrame.Position).Magnitude
+        if dist > 80 then
+            local tof = math.min(dist / Settings.BulletSpeed, Settings.LeadCap)
+            target.point = base + vel * tof
             return
         end
     end
-
-    local m, part, score = bestVisible(cam, center, camPos, 8)
-    if m then
-        target = { model = m, part = part, point = part.Position, score = score }
-    else
-        target = nil
-    end
+    target.point = base
 end
 
 local function updateReport(dt)
@@ -349,6 +505,10 @@ lockRing.Transparency = 0.9
 lockRing.Radius = 5
 lockRing.Visible = false
 
+local COLOR_INF = Color3.fromRGB(255, 70, 70)
+local COLOR_VEH = Color3.fromRGB(255, 160, 40)
+local COLOR_TARGET = Color3.fromRGB(0, 230, 255)
+
 local function hide(entry)
     entry.box.Visible = false
     entry.label.Visible = false
@@ -371,50 +531,76 @@ local function slot(i)
     return e
 end
 
+local function projectedBox(cam, m)
+    if not m then return nil end
+    local ok, cf, size = pcall(function()
+        return m:GetBoundingBox()
+    end)
+    if not ok or not cf then return nil end
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local any = false
+    for sx = -0.5, 0.5, 1 do
+        for sy = -0.5, 0.5, 1 do
+            for sz = -0.5, 0.5, 1 do
+                local wp = cf * Vector3.new(sx * size.X, sy * size.Y, sz * size.Z)
+                local sp, on = cam:WorldToViewportPoint(wp)
+                if on and sp.Z > 0 then
+                    any = true
+                    minX = math.min(minX, sp.X)
+                    minY = math.min(minY, sp.Y)
+                    maxX = math.max(maxX, sp.X)
+                    maxY = math.max(maxY, sp.Y)
+                end
+            end
+        end
+    end
+    if not any or maxX <= minX or maxY <= minY then return nil end
+    return minX, minY, maxX, maxY
+end
+
 local function drawESP(cam)
     local idx = 0
     if Settings.ESP then
-        for _, m in ipairs(enemyCache) do
-            if m.Parent then
-                local ok, cf, size = pcall(function()
-                    return m:GetBoundingBox()
-                end)
-                if ok and cf then
-                    local minX, minY = math.huge, math.huge
-                    local maxX, maxY = -math.huge, -math.huge
-                    local any = false
-                    for sx = -0.5, 0.5, 1 do
-                        for sy = -0.5, 0.5, 1 do
-                            for sz = -0.5, 0.5, 1 do
-                                local wp = cf * Vector3.new(sx * size.X, sy * size.Y, sz * size.Z)
-                                local sp, on = cam:WorldToViewportPoint(wp)
-                                if on and sp.Z > 0 then
-                                    any = true
-                                    minX = math.min(minX, sp.X)
-                                    minY = math.min(minY, sp.Y)
-                                    maxX = math.max(maxX, sp.X)
-                                    maxY = math.max(maxY, sp.Y)
-                                end
-                            end
-                        end
-                    end
-                    if any and maxX > minX and maxY > minY then
-                        idx += 1
-                        local e = slot(idx)
-                        local isTarget = target and target.model == m
-                        local color = isTarget and Color3.fromRGB(0, 230, 255) or Color3.fromRGB(255, 70, 70)
-                        e.box.Color = color
-                        e.box.Position = Vector2.new(minX, minY)
-                        e.box.Size = Vector2.new(maxX - minX, maxY - minY)
-                        e.box.Visible = true
-                        e.label.Color = color
-                        e.label.Position = Vector2.new(minX, minY - 16)
-                        local root = m:FindFirstChild("HumanoidRootPart")
-                        local d = root and math.floor((root.Position - cam.CFrame.Position).Magnitude) or 0
-                        e.label.Text = m.Name .. "  " .. d .. "m"
-                        e.label.Visible = true
-                    end
+        for _, e in ipairs(entityCache) do
+            local minX, minY, maxX, maxY
+            if e.kind == "inf" then
+                if e.model.Parent then
+                    minX, minY, maxX, maxY = projectedBox(cam, e.model)
                 end
+            else
+                local pos = e.point
+                local sp, on = cam:WorldToViewportPoint(pos)
+                if on and sp.Z > 0 then
+                    local d = (pos - cam.CFrame.Position).Magnitude
+                    local half = math.clamp(9000 / math.max(d, 1), 6, 60)
+                    minX, minY = sp.X - half, sp.Y - half
+                    maxX, maxY = sp.X + half, sp.Y + half
+                end
+            end
+
+            if minX then
+                idx += 1
+                local s = slot(idx)
+                local isTarget = target and target.key == entityKey(e)
+                local color = isTarget and COLOR_TARGET
+                    or (e.kind == "veh" and COLOR_VEH or COLOR_INF)
+                s.box.Color = color
+                s.box.Position = Vector2.new(minX, minY)
+                s.box.Size = Vector2.new(maxX - minX, maxY - minY)
+                s.box.Visible = true
+                s.label.Color = color
+                s.label.Position = Vector2.new(minX, minY - 16)
+
+                local pos = e.kind == "inf" and entityPos(e) or e.point
+                local dist = pos and math.floor((pos - cam.CFrame.Position).Magnitude) or 0
+                if e.kind == "veh" then
+                    s.label.Text = string.format("%s #%d  %d%%  %dm",
+                        e.label or "Vehicle", e.id, math.floor((e.health or 0) * 100), dist)
+                else
+                    s.label.Text = e.model.Name .. "  " .. dist .. "m"
+                end
+                s.label.Visible = true
             end
         end
     end
@@ -427,29 +613,44 @@ local function drawFov(cam)
     local center = cam.ViewportSize * 0.5
     fovCircle.Position = center
     fovCircle.Radius = Settings.FOV
-    fovCircle.Color = target and Color3.fromRGB(0, 230, 255) or Color3.fromRGB(255, 255, 255)
+    fovCircle.Color = target and COLOR_TARGET or Color3.fromRGB(255, 255, 255)
     fovCircle.Visible = Settings.Enabled and Settings.FOVCircle
+end
+
+local function targetLabel()
+    if not target then return nil end
+    if target.kind == "veh" then
+        return string.format("LOCK  %s #%d  [%d%%]", target.label or "Vehicle", target.id,
+            math.floor(math.clamp(target.health or 0, 0, 1) * 100))
+    end
+    return "LOCK  " .. target.model.Name .. "  [" .. (target.part and target.part.Name or "body") .. "]"
 end
 
 local function drawHud(cam)
     local center = cam.ViewportSize * 0.5
-    hud.Text = ("AIM %s   RUN %s   ESP %s   FOV %d   TGT %d")
+    local vehCount = 0
+    for _, e in ipairs(entityCache) do
+        if e.kind == "veh" then vehCount += 1 end
+    end
+    hud.Text = ("AIM %s   MODE %s   RUN %s   ESP %s   FOV %d   INF %d   VEH %d")
         :format(Settings.Enabled and "ON" or "OFF",
+            Settings.TargetMode:upper(),
             Settings.AutoRun and "ON" or "OFF",
             Settings.ESP and "ON" or "OFF",
             Settings.FOV,
-            #enemyCache)
+            #entityCache - vehCount,
+            vehCount)
     hud.Visible = true
 
     if Settings.Enabled and target then
         local sp, on = cam:WorldToViewportPoint(target.point)
         if on and sp.Z > 0 then
             lockRing.Position = Vector2.new(sp.X, sp.Y)
-            lockRing.Color = Color3.fromRGB(0, 230, 255)
+            lockRing.Color = COLOR_TARGET
             lockRing.Visible = true
             lockLabel.Position = Vector2.new(center.X, center.Y + Settings.FOV + 22)
-            lockLabel.Text = "LOCK  " .. target.model.Name .. "  [" .. target.part.Name .. "]"
-            lockLabel.Color = Color3.fromRGB(0, 230, 255)
+            lockLabel.Text = targetLabel()
+            lockLabel.Color = COLOR_TARGET
             lockLabel.Visible = true
             return
         end
@@ -478,10 +679,7 @@ local function step(dt)
         nextScan = now + (target and 0.05 or 0.02)
     end
 
-    if target then
-        target.point = target.part.Position
-    end
-
+    updateAimPoint(dt)
     updateReport(dt)
     manageRun()
     drawESP(cam)
@@ -506,6 +704,18 @@ local function setAutoRun(on)
     end
 end
 
+local function cycleMode()
+    if Settings.TargetMode == "both" then
+        Settings.TargetMode = "vehicles"
+    elseif Settings.TargetMode == "vehicles" then
+        Settings.TargetMode = "infantry"
+    else
+        Settings.TargetMode = "both"
+    end
+    target = nil
+    print("[UgcAim] target mode " .. Settings.TargetMode)
+end
+
 S.connect(UserInputService.InputBegan, function(input, processed)
     if processed then return end
     if input.KeyCode == Enum.KeyCode.F1 then
@@ -520,6 +730,8 @@ S.connect(UserInputService.InputBegan, function(input, processed)
     elseif input.KeyCode == Enum.KeyCode.F4 then
         setAutoRun(not Settings.AutoRun)
         print("[UgcAim] autorun " .. (Settings.AutoRun and "ON" or "OFF"))
+    elseif input.KeyCode == Enum.KeyCode.F5 then
+        cycleMode()
     end
 end)
 
@@ -538,26 +750,38 @@ S.onCleanup(function()
     lockRing:Remove()
 end)
 
-getgenv().UgcAim = { Settings = Settings, setAutoRun = setAutoRun }
+getgenv().UgcAim = { Settings = Settings, setAutoRun = setAutoRun, cycleMode = cycleMode }
 
 getgenv().UgcAimStatus = function()
+    local veh, inf = 0, 0
+    for _, e in ipairs(entityCache) do
+        if e.kind == "veh" then veh += 1 else inf += 1 end
+    end
     return {
         installed = true,
         enabled = Settings.Enabled,
         esp = Settings.ESP,
         fov = Settings.FOV,
         maxDistance = Settings.MaxDistance,
+        maxVehicleDistance = Settings.MaxVehicleDistance,
+        mode = Settings.TargetMode,
+        lead = Settings.Lead,
         autoRun = Settings.AutoRun,
         autoSprint = Settings.AutoSprint,
         sprintHeld = Movement and Movement.sprintHeld() or nil,
         runHeld = runHeld,
-        target = target and target.model.Name or nil,
-        part = target and target.part.Name or nil,
-        enemies = #enemyCache,
+        target = target and (target.kind == "veh"
+            and string.format("%s#%d", target.label or "Vehicle", target.id)
+            or target.name) or nil,
+        targetKind = target and target.kind or nil,
+        targetHealth = target and target.health or nil,
+        part = target and target.part and target.part.Name or nil,
+        infantry = inf,
+        vehicles = veh,
         poolSize = #pool,
         scanMs = scanMs,
         reportDir = reportDir and tostring(reportDir) or nil,
     }
 end
 
-print("[UgcAim] installed - silent aim, visible-part targeting, ESP, FOV, autorun (F1/F2/F3/F4)")
+print("[UgcAim] installed - silent aim, infantry+vehicle lock, ESP, FOV, autorun (F1-F5)")
