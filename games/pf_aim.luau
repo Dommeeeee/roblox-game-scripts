@@ -50,6 +50,7 @@ local Status = {
     cTotal = 0,
     cVis = 0,
     cFov = 0,
+    tags = 0,
     error = nil,
 }
 getgenv().PFAimStatus = Status
@@ -102,10 +103,27 @@ local function findTagModel(folder)
     local found = {}
     for _, d in ipairs(folder:GetDescendants()) do
         if d:IsA("TextLabel") and d.Name == "PlayerTag" then
-            local headPart = d.Parent and d.Parent.Parent
-            local model = headPart and headPart.Parent
-            if model and headPart:IsA("BasePart") and not found[model] then
-                found[model] = { model = model, head = headPart, tag = d }
+            local head = nil
+            local node = d.Parent
+            while node and node ~= folder do
+                if node:IsA("BasePart") then
+                    head = node
+                    break
+                end
+                node = node.Parent
+            end
+            local model = nil
+            local walk = d.Parent
+            while walk and walk ~= folder do
+                if walk:IsA("Model") then
+                    model = walk
+                    break
+                end
+                walk = walk.Parent
+            end
+            if not model and head then model = head.Parent end
+            if model and not found[model] then
+                found[model] = { model = model, head = head, tag = d }
             end
         end
     end
@@ -128,14 +146,37 @@ local function classify(ch)
         end
     end
     if #bodyParts == 0 then
-        for _, c in ipairs(model:GetChildren()) do
-            if c:IsA("BasePart") and c ~= head then
-                table.insert(bodyParts, c)
+        for _, c in ipairs(model:GetDescendants()) do
+            if c:IsA("BasePart") then
+                local okPart = true
+                local walk = c.Parent
+                while walk and walk ~= model do
+                    if walk:IsA("Model") then
+                        okPart = false
+                        break
+                    end
+                    walk = walk.Parent
+                end
+                if okPart and c ~= head then
+                    table.insert(bodyParts, c)
+                end
             end
         end
     end
 
-    local headPos = head.Position
+    local reference = head
+    if not reference then
+        local bestY = -math.huge
+        for _, p in ipairs(bodyParts) do
+            if p.Position.Y > bestY then
+                bestY = p.Position.Y
+                reference = p
+            end
+        end
+    end
+    if not reference then return end
+
+    local headPos = reference.Position
     local torso, limbs = {}, {}
     local cand = {}
     for _, p in ipairs(bodyParts) do
@@ -176,13 +217,32 @@ local function refreshCharacters()
     if not folder then return end
 
     local found = findTagModel(folder)
+    local tagCount = 0
+    local selfColor = nil
+    for model, entry in pairs(found) do
+        tagCount = tagCount + 1
+        local tagText = entry.tag.Text
+        local isSelf = (LP.Character and model == LP.Character)
+            or (tagText == LP.Name or tagText == LP.DisplayName)
+        if isSelf then selfColor = entry.tag.TextColor3 end
+    end
+    Status.tags = tagCount
+
     for model, entry in pairs(found) do
         local tag = entry.tag
         local tagText = tag.Text
         local isSelf = (LP.Character and model == LP.Character)
             or (tagText == LP.Name or tagText == LP.DisplayName)
         local c = tag.TextColor3
-        local enemy = c.R > c.G
+        local enemy
+        if selfColor then
+            local dr = c.R - selfColor.R
+            local dg = c.G - selfColor.G
+            local db = c.B - selfColor.B
+            enemy = math.sqrt(dr * dr + dg * dg + db * db) > 0.25
+        else
+            enemy = c.R > c.G
+        end
 
         if isSelf then
             selfModel = model
@@ -574,7 +634,7 @@ local function renderOverlay()
             Status.view)
     end
     if hudLock then
-        local counts = string.format("tgt %d | vis %d | fov %d", Status.cTotal, Status.cVis, Status.cFov)
+        local counts = string.format("tags %d | tgt %d | vis %d | fov %d", Status.tags, Status.cTotal, Status.cVis, Status.cFov)
         if cachedTarget then
             hudLock.Text = string.format("lock: %s : %s | %s", tostring(Status.lockedModel), tostring(Status.lockedKind), counts)
         else
