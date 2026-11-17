@@ -401,10 +401,13 @@ local pending = {}
 
 local function rewritePacket(args, idx, name, target)
     local uniqueId = args[idx + 1]
-    local packet
+    local packet, packetIndex
     for i = idx + 1, math.min(idx + 3, args.n) do
         local v = args[i]
-        if type(v) == "table" and type(v.bullets) == "table" then packet = v break end
+        if type(v) == "table" and type(v.bullets) == "table" then
+            packet, packetIndex = v, i
+            break
+        end
     end
     if not packet then return false end
 
@@ -417,9 +420,7 @@ local function rewritePacket(args, idx, name, target)
     if not dir then return false end
 
     local fireTime = nil
-    for i = idx + 1, math.min(idx + 4, args.n) do
-        if typeof(args[i]) == "number" then fireTime = args[i] end
-    end
+    if typeof(args[packetIndex + 1]) == "number" then fireTime = args[packetIndex + 1] end
 
     local tickets = {}
     local count = 0
