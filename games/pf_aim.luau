@@ -26,7 +26,7 @@ local Settings = {
     AssistMaxStep = 140,
     ESP = true,
     FOVCircle = true,
-    FOVRadius = 160,
+    FOVRadius = 200,
     MaxDistance = 700,
     MaxESP = 1500,
     TeamCheck = true,
@@ -47,6 +47,9 @@ local Status = {
     lockedKind = nil,
     assistFrames = 0,
     view = "0,0",
+    cTotal = 0,
+    cVis = 0,
+    cFov = 0,
     error = nil,
 }
 getgenv().PFAimStatus = Status
@@ -311,15 +314,24 @@ local function resolveTarget(force)
     end
     table.sort(candidates, function(a, b) return a.d < b.d end)
 
+    Status.cTotal = #candidates
+    Status.cVis = 0
+    Status.cFov = 0
+
     local best, bestScore = nil, nil
-    for i = 1, math.min(#candidates, 4) do
+    local scanned = 0
+    for i = 1, #candidates do
+        if scanned >= 12 then break end
+        scanned = scanned + 1
         local ch = candidates[i].ch
         local hit = visiblePoint(ch)
         if hit then
+            Status.cVis = Status.cVis + 1
             local sp = project(hit.point)
             if sp then
                 local d = (sp - center).Magnitude
                 if d <= fovPx then
+                    Status.cFov = Status.cFov + 1
                     local penalty = hit.kind == "torso" and 0 or 20
                     local score = d + penalty
                     if not bestScore or score < bestScore then
@@ -554,7 +566,7 @@ local function renderOverlay()
     end
 
     if hudLine then
-        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx | view %s",
+        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx (F7/F8) | view %s",
             Settings.Enabled and "on" or "off",
             Settings.ESP and "on" or "off",
             Settings.Assist and "on" or "off",
@@ -562,10 +574,11 @@ local function renderOverlay()
             Status.view)
     end
     if hudLock then
+        local counts = string.format("tgt %d | vis %d | fov %d", Status.cTotal, Status.cVis, Status.cFov)
         if cachedTarget then
-            hudLock.Text = string.format("lock: %s : %s", tostring(Status.lockedModel), tostring(Status.lockedKind))
+            hudLock.Text = string.format("lock: %s : %s | %s", tostring(Status.lockedModel), tostring(Status.lockedKind), counts)
         else
-            hudLock.Text = ""
+            hudLock.Text = "no lock | " .. counts
         end
     end
 end
@@ -587,6 +600,10 @@ connect(UIS.InputBegan, function(input, gp)
     elseif key == Enum.KeyCode.F5 then
         Settings.Assist = not Settings.Assist
         Status.assist = Settings.Assist
+    elseif key == Enum.KeyCode.F7 then
+        Settings.FOVRadius = math.clamp(Settings.FOVRadius + 20, 40, 600)
+    elseif key == Enum.KeyCode.F8 then
+        Settings.FOVRadius = math.clamp(Settings.FOVRadius - 20, 40, 600)
     end
 end)
 connect(UIS.InputEnded, function(input)
