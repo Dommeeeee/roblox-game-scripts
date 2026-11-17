@@ -45,6 +45,7 @@ local Status = {
     lockedModel = nil,
     lockedPart = nil,
     lockedKind = nil,
+    lockedWall = false,
     assistFrames = 0,
     view = "0,0",
     cTotal = 0,
@@ -402,15 +403,39 @@ local function resolveTarget(force)
         end
     end
 
+    if not best then
+        local fb, fbD = nil, nil
+        for i = 1, math.min(#candidates, 12) do
+            local c = candidates[i]
+            if not fbD or c.d < fbD then
+                fb, fbD = c.ch, c.d
+            end
+        end
+        if fb and fbD and fbD <= fovPx then
+            local entry = fb.parts[1]
+            if entry and entry.part and entry.part.Parent then
+                best = {
+                    point = entry.part.CFrame.Position,
+                    part = entry.part,
+                    kind = entry.kind,
+                    model = fb.model,
+                    wall = true,
+                }
+            end
+        end
+    end
+
     if best then
         cachedTarget = best
         Status.lockedModel = best.model.Name
         Status.lockedPart = best.part.Name
         Status.lockedKind = best.kind
+        Status.lockedWall = best.wall == true
     else
         Status.lockedModel = nil
         Status.lockedPart = nil
         Status.lockedKind = nil
+        Status.lockedWall = false
     end
     return best
 end
@@ -553,7 +578,7 @@ local function renderOverlay()
         if Settings.FOVCircle then
             ring.Position = UDim2.fromScale(0.5, 0.5)
             ring.Size = UDim2.fromOffset(fovPx * 2, fovPx * 2)
-            ringStroke.Color = cachedTarget and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(235, 235, 235)
+            ringStroke.Color = cachedTarget and (cachedTarget.wall and Color3.fromRGB(255, 200, 60) or Color3.fromRGB(90, 255, 120)) or Color3.fromRGB(235, 235, 235)
         end
     end
 
@@ -636,7 +661,8 @@ local function renderOverlay()
     if hudLock then
         local counts = string.format("tags %d | tgt %d | vis %d | fov %d", Status.tags, Status.cTotal, Status.cVis, Status.cFov)
         if cachedTarget then
-            hudLock.Text = string.format("lock: %s : %s | %s", tostring(Status.lockedModel), tostring(Status.lockedKind), counts)
+            hudLock.Text = string.format("lock: %s : %s%s | %s", tostring(Status.lockedModel), tostring(Status.lockedKind),
+                cachedTarget.wall and " wall" or "", counts)
         else
             hudLock.Text = "no lock | " .. counts
         end
@@ -673,7 +699,7 @@ end)
 local function assistStep()
     if not (Settings.Enabled and Settings.Assist and firing) then return end
     local target = resolveTarget(false)
-    if not target then return end
+    if not target or target.wall then return end
     local sp = project(assistPoint(target))
     if not sp then return end
     local center = screenCenter()
