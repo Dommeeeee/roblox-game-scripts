@@ -1,13 +1,13 @@
 -- Phantom Forces silent aim: body-first targeting, visible-part priority,
--- Drawing ESP + FOV circle, newbullets direction rewrite on the wire.
--- Camera is read-only. No weapon CFrame writes, no Highlight, no character edits.
--- PF characters are non-queryable mesh hitboxes under workspace.Players, so
--- visibility is world-occlusion only; head mesh is identified by proximity to
--- the NameTagGui anchor and never targeted.
+-- Drawing ESP + FOV circle, newbullets direction rewrite, and hit claims.
+-- Camera read-only. No weapon CFrame writes, no Highlight, no character edits.
+-- PF sends bypass __namecall (captured C FireServer), so both paths are hooked.
+-- Claims reuse the game's own next send so the LCG key sequence never desyncs.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local LP = Players.LocalPlayer
 
@@ -31,6 +31,7 @@ local Settings = {
     Lead = true,
     BulletSpeed = 900,
     LeadCap = 0.45,
+    ClaimHits = true,
 }
 
 local Status = {
@@ -39,13 +40,18 @@ local Status = {
     esp = Settings.ESP,
     fov = Settings.FOVCircle,
     hook = false,
+    fireHook = false,
     enemies = 0,
     players = 0,
     lockedModel = nil,
     lockedPart = nil,
     lockedKind = nil,
     shots = 0,
+    sends = 0,
     rewrites = 0,
+    claims = 0,
+    claimsSent = 0,
+    mapFail = 0,
     error = nil,
 }
 getgenv().PFAimStatus = Status
@@ -92,16 +98,38 @@ local function volumeOf(part)
     return math.max(s.X * s.Y * s.Z, 0.001)
 end
 
-local function findTagModel(folder)
-    local found = {}
-    for _, d in ipairs(folder:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Name == "PlayerTag" then
-            local headPart = d.Parent and d.Parent.Parent
-            local model = headPart and headPart.Parent
-            if model and headPart:IsA("BasePart") and not found[model] then
-                found[model] = { model = model, head = headPart, tag = d }
+local tagPlayerCache = {}
+local function playerFromTag(tag)
+    if tagPlayerCache[tag] then return tagPlayerCache[tag] end
+    local text = tag.Text
+    local found = nil
+    local low = string.lower(text)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if string.lower(p.Name) == low or string.lower(p.DisplayName) == low then
+            found = p
+            break
+        end
+    end
+    if not found then
+        for _, d in ipairs(tag:GetDescendants()) do
+            local url = nil
+            if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+                url = d.Image
+            end
+            if url then
+                local id = string.match(url, "id=(%d+)")
+                if id then
+                    local p = Players:GetPlayerByUserId(tonumber(id))
+                    if p then
+                        found = p
+                        break
+                    end
+                end
             end
         end
+    end
+    if found then
+        tagPlayerCache[tag] = found
     end
     return found
 end
@@ -131,13 +159,12 @@ local function classify(ch)
 
     local headPos = head.Position
     local torso, limbs = {}, {}
-
     local cand = {}
     for _, p in ipairs(bodyParts) do
         local offset = p.Position - headPos
         local horiz = Vector2.new(offset.X, offset.Z).Magnitude
         if offset.Magnitude >= 0.75 then
-            table.insert(cand, { part = p, vol = volumeOf(p), horiz = horiz, dy = -offset.Y })
+            table.insert(cand, { part = p, vol = volumeOf(p), horiz = horiz })
         end
     end
     table.sort(cand, function(a, b) return a.vol > b.vol end)
@@ -157,8 +184,21 @@ local function classify(ch)
         table.insert(parts, { part = c.part, kind = "limb", vol = c.vol })
     end
     ch.parts = parts
-    ch.torsoParts = torso
     ch.allParts = bodyParts
+end
+
+local function findTagModel(folder)
+    local found = {}
+    for _, d in ipairs(folder:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "PlayerTag" then
+            local headPart = d.Parent and d.Parent.Parent
+            local model = headPart and headPart.Parent
+            if model and headPart:IsA("BasePart") and not found[model] then
+                found[model] = { model = model, head = headPart, tag = d }
+            end
+        end
+    end
+    return found
 end
 
 local function refreshCharacters()
@@ -177,9 +217,8 @@ local function refreshCharacters()
         local tagText = tag.Text
         local isSelf = (LP.Character and model == LP.Character)
             or (tagText == LP.Name or tagText == LP.DisplayName)
-        local enemy = true
         local c = tag.TextColor3
-        enemy = c.R > c.G
+        local enemy = c.R > c.G
 
         if isSelf then
             selfModel = model
@@ -188,6 +227,7 @@ local function refreshCharacters()
                 model = model,
                 head = entry.head,
                 tagText = tagText,
+                tag = tag,
                 enemy = enemy,
                 dead = false,
                 parts = {},
@@ -195,6 +235,7 @@ local function refreshCharacters()
             local hum = model:FindFirstChildOfClass("Humanoid")
             ch.hum = hum
             if hum and hum.Health <= 0 then ch.dead = true end
+            ch.player = playerFromTag(tag)
             pcall(classify, ch)
             if #ch.parts > 0 then
                 table.insert(chars, ch)
@@ -252,6 +293,7 @@ local function visiblePoint(ch)
                         part = part,
                         kind = entry.kind,
                         model = ch.model,
+                        player = ch.player,
                     }
                 end
             end
@@ -333,13 +375,7 @@ local function resolveTarget(force)
     return best
 end
 
-local function applyTarget(itarget, packet)
-    if not itarget then return 0 end
-    local origin = nil
-    if typeof(packet.firepos) == "Vector3" then origin = packet.firepos
-    elseif typeof(packet.camerapos) == "Vector3" then origin = packet.camerapos
-    else origin = Camera.CFrame.Position end
-
+local function aimDirection(itarget, origin)
     local aim = itarget.point
     if Settings.Lead then
         local part = itarget.part
@@ -350,16 +386,45 @@ local function applyTarget(itarget, packet)
             aim = aim + vel * t
         end
     end
-
     local dir = aim - origin
-    if dir.Magnitude < 0.5 then return 0 end
-    dir = dir.Unit
+    if dir.Magnitude < 0.5 then return nil end
+    return dir.Unit, aim
+end
 
+local function partLabel(kind)
+    if kind == "torso" then return "Torso" end
+    return "Left Arm"
+end
+
+local remote = ReplicatedStorage:FindFirstChild("RemoteEvent")
+local pending = {}
+
+local function rewritePacket(args, idx, name, target)
+    local uniqueId = args[idx + 1]
+    local packet
+    for i = idx + 1, math.min(idx + 3, args.n) do
+        local v = args[i]
+        if type(v) == "table" and type(v.bullets) == "table" then packet = v break end
+    end
+    if not packet then return false end
+
+    local origin = nil
+    if typeof(packet.firepos) == "Vector3" then origin = packet.firepos
+    elseif typeof(packet.camerapos) == "Vector3" then origin = packet.camerapos
+    else origin = Camera.CFrame.Position end
+
+    local dir, aim = aimDirection(target, origin)
+    if not dir then return false end
+
+    local fireTime = nil
+    for i = idx + 1, math.min(idx + 4, args.n) do
+        if typeof(args[i]) == "number" then fireTime = args[i] end
+    end
+
+    local tickets = {}
     local count = 0
-    local bullets = packet.bullets
-    if type(bullets) ~= "table" then return 0 end
-    for i = 1, #bullets do
-        local entry = bullets[i]
+    for i = 1, #packet.bullets do
+        local entry = packet.bullets[i]
         if type(entry) == "table" then
             if type(entry[1]) == "Vector3" then
                 entry[1] = dir
@@ -368,58 +433,131 @@ local function applyTarget(itarget, packet)
                 entry.lookVector = dir
                 count = count + 1
             end
+            if entry[2] ~= nil then table.insert(tickets, entry[2]) end
         end
     end
-    return count
+
+    if count > 0 and Settings.ClaimHits and target.player and uniqueId ~= nil then
+        for _, ticket in ipairs(tickets) do
+            table.insert(pending, {
+                uniqueId = uniqueId,
+                ticket = ticket,
+                player = target.player,
+                point = aim,
+                label = partLabel(target.kind),
+                firedAt = os.clock(),
+                fireTime = fireTime,
+            })
+        end
+        Status.claims = #pending
+    end
+    return count > 0
 end
 
-local function handleRemote(self, ...)
-    if not (Settings.Enabled and Settings.SilentAim) then return end
-    local char = LP.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return end
-
-    local args = table.pack(...)
-    local slot
-    for i = 1, args.n do
-        if args[i] == "newbullets" then slot = i break end
+local function buildClaim(idx, args)
+    local now = os.clock()
+    for i, claim in ipairs(pending) do
+        local age = now - claim.firedAt
+        if age > 2.5 then
+            table.remove(pending, i)
+            Status.claims = #pending
+            return nil
+        end
     end
-    if not slot then return end
+    local claim = pending[1]
+    if not claim then return nil end
+    if now - claim.firedAt < 0.08 then return nil end
+    table.remove(pending, 1)
+    Status.claims = #pending
 
-    local packet
-    for i = slot + 1, math.min(slot + 3, args.n) do
-        local v = args[i]
-        if type(v) == "table" and type(v.bullets) == "table" then packet = v break end
-    end
-    if not packet then return end
+    local t = claim.fireTime
+    if typeof(t) ~= "number" then t = 0 end
+    args[idx + 1] = claim.uniqueId
+    args[idx + 2] = claim.player
+    args[idx + 3] = claim.point
+    args[idx + 4] = claim.label
+    args[idx + 5] = claim.ticket
+    args[idx + 6] = t + 0.05
+    args.n = idx + 6
+    Status.claimsSent = Status.claimsSent + 1
+    return true
+end
 
-    local target = resolveTarget(true)
-    if not target then return end
-    local n = applyTarget(target, packet)
-    if n > 0 then
-        Status.shots = Status.shots + 1
-        Status.rewrites = Status.rewrites + n
+local function patchSend(self, args)
+    if remote and self ~= remote then return false end
+    Status.sends = Status.sends + 1
+    local idx, name
+    for i = 1, math.min(args.n, 3) do
+        if type(args[i]) == "string" then
+            idx, name = i, args[i]
+            break
+        end
     end
+    if not idx then return false end
+
+    if name == "newbullets" then
+        if not (Settings.Enabled and Settings.SilentAim) then return false end
+        local char = LP.Character
+        if not char then return false end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then return false end
+        local target = resolveTarget(true)
+        if not target then return false end
+        if not target.player then Status.mapFail = Status.mapFail + 1 end
+        local ok = rewritePacket(args, idx, name, target)
+        if ok then
+            Status.shots = Status.shots + 1
+            Status.rewrites = Status.rewrites + 1
+        end
+        return ok
+    end
+
+    if name == "ping" and Settings.ClaimHits and #pending > 0 then
+        return buildClaim(idx, args) or false
+    end
+    return false
 end
 
 local oldNamecall, ourNamecall
-local function installHook()
+local originalFire, fireWrapper, fireHooked = nil, nil, false
+
+local function installHooks()
     local ok, mt = pcall(getrawmetatable, game)
-    if not ok or not mt then return false end
-    pcall(setreadonly, mt, false)
-    oldNamecall = mt.__namecall
-    if type(oldNamecall) ~= "function" then pcall(setreadonly, mt, true) return false end
-    ourNamecall = newcclosure(function(self, ...)
-        if getnamecallmethod() == "FireServer" then
-            pcall(handleRemote, self, ...)
-        end
-        return oldNamecall(self, ...)
-    end)
-    mt.__namecall = ourNamecall
-    pcall(setreadonly, mt, true)
-    return true
+    if ok and mt and type(mt.__namecall) == "function" then
+        pcall(setreadonly, mt, false)
+        oldNamecall = mt.__namecall
+        ourNamecall = newcclosure(function(self, ...)
+            if getnamecallmethod() == "FireServer" then
+                local args = table.pack(...)
+                local ok2, changed = pcall(patchSend, self, args)
+                if ok2 and changed then
+                    return oldNamecall(self, table.unpack(args, 1, args.n))
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+        mt.__namecall = ourNamecall
+        pcall(setreadonly, mt, true)
+        Status.hook = true
+    end
+
+    if remote and type(remote.FireServer) == "function" then
+        originalFire = remote.FireServer
+        fireWrapper = newcclosure(function(self, ...)
+            local args = table.pack(...)
+            local ok2, changed = pcall(patchSend, self, args)
+            if ok2 and changed then
+                return originalFire(self, table.unpack(args, 1, args.n))
+            end
+            return originalFire(self, ...)
+        end)
+        local ok3 = pcall(hookfunction, originalFire, fireWrapper)
+        fireHooked = ok3
+        Status.fireHook = ok3
+    end
 end
+
+installHooks()
 
 local esp = {}
 local fovCircle = newDrawing("Circle")
@@ -492,8 +630,7 @@ local function renderESP()
                 local minY, maxY = math.huge, -math.huge
                 local sum = Vector3.zero
                 local n = 0
-                for _, entry in ipairs(ch.allParts or {}) do
-                    local p = entry
+                for _, p in ipairs(ch.allParts or {}) do
                     if p and p.Parent then
                         minY = math.min(minY, p.Position.Y - p.Size.Y / 2)
                         maxY = math.max(maxY, p.Position.Y + p.Size.Y / 2)
@@ -514,10 +651,8 @@ local function renderESP()
                 end
                 if n > 0 then
                     local centroid = sum / n
-                    local topWorld = Vector3.new(centroid.X, maxY + 0.35, centroid.Z)
-                    local bottomWorld = Vector3.new(centroid.X, minY, centroid.Z)
-                    local pTop = project(topWorld)
-                    local pBot = project(bottomWorld)
+                    local pTop = project(Vector3.new(centroid.X, maxY + 0.35, centroid.Z))
+                    local pBot = project(Vector3.new(centroid.X, minY, centroid.Z))
                     local dist = (centroid - camPos).Magnitude
                     local show = pTop and pBot and dist <= Settings.MaxESP
                     if show then
@@ -582,12 +717,13 @@ local function renderESP()
         end
     end
     if hudLine then
-        hudLine.Text = string.format("pf aim %s | silent %s | esp %s | fov %d | %d hits",
+        hudLine.Text = string.format("pf aim %s | silent %s | esp %s | fov %d | rw %d | cl %d",
             Settings.Enabled and "on" or "off",
             Settings.SilentAim and "on" or "off",
             Settings.ESP and "on" or "off",
             Settings.FOVRadius,
-            Status.rewrites)
+            Status.rewrites,
+            Status.claimsSent)
     end
     if hudLock then
         if cachedTarget then
@@ -620,8 +756,6 @@ connect(UIS.InputBegan, function(input, gp)
     end
 end)
 
-Status.hook = installHook()
-
 local function stillAlive()
     if type(S.alive) ~= "function" then return true end
     local ok, v = pcall(S.alive)
@@ -631,7 +765,8 @@ end
 
 task.spawn(function()
     while stillAlive() do
-        pcall(refreshCharacters)
+        local ok, err = pcall(refreshCharacters)
+        if not ok then Status.error = tostring(err) end
         pcall(function()
             Status.players = #chars
             Status.enemies = #chars
@@ -646,6 +781,7 @@ getgenv().PFAim = {
     Status = Status,
     Resolve = resolveTarget,
     Characters = function() return chars end,
+    Pending = function() return pending end,
 }
 
 local function cleanup()
@@ -664,6 +800,9 @@ local function cleanup()
             mt.__namecall = oldNamecall
             pcall(setreadonly, mt, true)
         end
+    end
+    if fireHooked and originalFire then
+        pcall(function() restorefunction(originalFire) end)
     end
     getgenv().pfAimCleanup = nil
     getgenv().PFAimStatus = nil
