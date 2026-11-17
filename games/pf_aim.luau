@@ -21,12 +21,13 @@ if getgenv().pfAimCleanup then pcall(getgenv().pfAimCleanup) end
 
 local Settings = {
     Enabled = true,
-    Assist = false,
+    Assist = true,
     AssistGain = 1.4,
     AssistMaxStep = 140,
     ESP = true,
     FOVCircle = true,
     FOVRadius = 200,
+    AutoFOV = true,
     MaxDistance = 700,
     MaxESP = 1500,
     TeamCheck = true,
@@ -48,6 +49,7 @@ local Status = {
     lockedWall = false,
     assistFrames = 0,
     view = "0,0",
+    gatePx = 0,
     cTotal = 0,
     cVis = 0,
     cFov = 0,
@@ -306,7 +308,8 @@ end
 local function pointVisible(camPos, pt, dist, params)
     local dir = pt - camPos
     if dir.Magnitude < 2 then return true end
-    local result = workspace:Raycast(camPos, dir, params)
+    local ok, result = pcall(function() return workspace:Raycast(camPos, dir, params) end)
+    if not ok then return true end
     if not result then return true end
     return (result.Position - camPos).Magnitude >= dist - 0.25
 end
@@ -349,7 +352,10 @@ local function resolveTarget(force)
 
     local center = screenCenter()
     local camPos = Camera.CFrame.Position
+    local vp = screenSize()
     local fovPx = fovRadiusPx()
+    local cap = math.min(vp.X, vp.Y) * 0.9
+    local gate = fovPx
 
     local candidates = {}
     for _, ch in ipairs(chars) do
@@ -380,6 +386,8 @@ local function resolveTarget(force)
     Status.cFov = 0
 
     local best, bestScore = nil, nil
+    local bestD = nil
+    local visHits = {}
     local scanned = 0
     for i = 1, #candidates do
         if scanned >= 12 then break end
@@ -391,15 +399,26 @@ local function resolveTarget(force)
             local sp = project(hit.point)
             if sp then
                 local d = (sp - center).Magnitude
-                if d <= fovPx then
-                    Status.cFov = Status.cFov + 1
-                    local penalty = hit.kind == "torso" and 0 or 20
-                    local score = d + penalty
-                    if not bestScore or score < bestScore then
-                        best, bestScore = hit, score
-                    end
+                table.insert(visHits, { hit = hit, d = d })
+                local penalty = hit.kind == "torso" and 0 or 20
+                local score = d + penalty
+                if not bestScore or score < bestScore then
+                    best, bestScore, bestD = hit, score, d
                 end
             end
+        end
+    end
+
+    if Settings.AutoFOV and bestD and bestD > gate then
+        gate = math.min(bestD, cap)
+    end
+
+    if best and bestD and bestD > gate then
+        best, bestScore, bestD = nil, nil, nil
+    end
+    for _, v in ipairs(visHits) do
+        if v.d <= gate then
+            Status.cFov = Status.cFov + 1
         end
     end
 
@@ -411,7 +430,10 @@ local function resolveTarget(force)
                 fb, fbD = c.ch, c.d
             end
         end
-        if fb and fbD and fbD <= fovPx then
+        if fb and fbD and Settings.AutoFOV and fbD <= cap then
+            gate = math.min(fbD, cap)
+        end
+        if fb and fbD and fbD <= gate then
             local entry = fb.parts[1]
             if entry and entry.part and entry.part.Parent then
                 best = {
@@ -424,6 +446,7 @@ local function resolveTarget(force)
             end
         end
     end
+    Status.gatePx = gate
 
     if best then
         cachedTarget = best
@@ -571,13 +594,15 @@ local function renderOverlay()
 
     local center = screenCenter()
     local fovPx = fovRadiusPx()
+    local gate = Status.gatePx
+    if not gate or gate < fovPx then gate = fovPx end
     Status.view = tostring(screenSize())
 
     if ring then
         ring.Visible = Settings.FOVCircle
         if Settings.FOVCircle then
             ring.Position = UDim2.fromScale(0.5, 0.5)
-            ring.Size = UDim2.fromOffset(fovPx * 2, fovPx * 2)
+            ring.Size = UDim2.fromOffset(gate * 2, gate * 2)
             ringStroke.Color = cachedTarget and (cachedTarget.wall and Color3.fromRGB(255, 200, 60) or Color3.fromRGB(90, 255, 120)) or Color3.fromRGB(235, 235, 235)
         end
     end
@@ -651,11 +676,11 @@ local function renderOverlay()
     end
 
     if hudLine then
-        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx (F7/F8) | view %s",
+        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | gate %dpx (F7/F8) | view %s",
             Settings.Enabled and "on" or "off",
             Settings.ESP and "on" or "off",
             Settings.Assist and "on" or "off",
-            math.floor(fovPx),
+            math.floor(gate),
             Status.view)
     end
     if hudLock then
