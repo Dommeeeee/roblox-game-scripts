@@ -26,6 +26,8 @@ local Settings = {
     AssistMaxStep = 36,
     AssistDeadzone = 1.5,
     Predict = 0.06,
+    BulletSpeed = 800,
+    LeadFactor = 1,
     ESP = true,
     FOVCircle = true,
     FOVRadius = 200,
@@ -742,6 +744,15 @@ local function assistStep()
     local target = resolveTarget(false)
     if not target or target.wall then return end
     local aimWorld = target.aim or target.point
+    local part = target.part
+    if Settings.LeadFactor and Settings.LeadFactor > 0 and part then
+        local vel = part.AssemblyLinearVelocity or part.Velocity
+        if vel and vel.Magnitude > 2 then
+            local dist = (aimWorld - Camera.CFrame.Position).Magnitude
+            local t = math.clamp(dist / math.max(Settings.BulletSpeed, 1), 0, 0.4)
+            aimWorld = aimWorld + vel * (t * Settings.LeadFactor)
+        end
+    end
     local sp = project(aimWorld)
     if not sp then return end
     local now = os.clock()
