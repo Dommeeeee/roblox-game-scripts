@@ -544,17 +544,23 @@ local function installHooks()
 
     if remote and type(remote.FireServer) == "function" then
         originalFire = remote.FireServer
+        local fireBackup = nil
         fireWrapper = newcclosure(function(self, ...)
             local args = table.pack(...)
             local ok2, changed = pcall(patchSend, self, args)
             if ok2 and changed then
-                return originalFire(self, table.unpack(args, 1, args.n))
+                return fireBackup(self, table.unpack(args, 1, args.n))
             end
-            return originalFire(self, ...)
+            return fireBackup(self, ...)
         end)
-        local ok3 = pcall(hookfunction, originalFire, fireWrapper)
-        fireHooked = ok3
-        Status.fireHook = ok3
+        local ok3, backup = pcall(hookfunction, originalFire, fireWrapper)
+        if ok3 and type(backup) == "function" then
+            fireBackup = backup
+            fireHooked = true
+        else
+            fireHooked = false
+        end
+        Status.fireHook = fireHooked
     end
 end
 
