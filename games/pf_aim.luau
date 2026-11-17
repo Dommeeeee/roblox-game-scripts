@@ -622,8 +622,15 @@ end)
 
 Status.hook = installHook()
 
+local function stillAlive()
+    if type(S.alive) ~= "function" then return true end
+    local ok, v = pcall(S.alive)
+    if not ok then return true end
+    return v ~= false
+end
+
 task.spawn(function()
-    while S.alive() do
+    while stillAlive() do
         pcall(refreshCharacters)
         pcall(function()
             Status.players = #chars
