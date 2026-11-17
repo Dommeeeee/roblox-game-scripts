@@ -44,6 +44,7 @@ local REGISTRY = {
     { name = "Vanta / Clover",   place = 76894257773137,  universe = nil,           script = "games/VantaCloverHub_v5.luau" },
     { name = "Murder Mystery 2", place = 142823291,       universe = nil,           script = "games/mm2_master_suite.luau" },
     { name = "Brookhaven",       place = 4924922222,      universe = nil,           script = "games/brookhaven_parlor_tricks.luau" },
+    { name = "Phantom Forces",   place = 292439477,       universe = 113491250,     script = "games/pf_aim.luau" },
 }
 
 local function resolve(placeId, universeId)
