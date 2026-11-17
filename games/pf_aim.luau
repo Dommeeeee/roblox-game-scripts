@@ -1,6 +1,9 @@
 -- Phantom Forces silent aim: body-first targeting, visible-part priority,
 -- Drawing ESP + FOV circle, newbullets direction rewrite on the wire.
 -- Camera is read-only. No weapon CFrame writes, no Highlight, no character edits.
+-- PF characters are non-queryable mesh hitboxes under workspace.Players, so
+-- visibility is world-occlusion only; head mesh is identified by proximity to
+-- the NameTagGui anchor and never targeted.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -37,6 +40,7 @@ local Status = {
     fov = Settings.FOVCircle,
     hook = false,
     enemies = 0,
+    players = 0,
     lockedModel = nil,
     lockedPart = nil,
     lockedKind = nil,
@@ -63,22 +67,11 @@ local function newDrawing(cls)
     return d
 end
 
-local function partKind(name)
-    local n = string.lower(string.gsub(name, "%s", ""))
-    if string.find(n, "head", 1, true) then return "head" end
-    if string.find(n, "torso", 1, true) or string.find(n, "chest", 1, true)
-        or string.find(n, "pelvis", 1, true) then return "torso" end
-    if string.find(n, "arm", 1, true) or string.find(n, "hand", 1, true) then return "arm" end
-    if string.find(n, "leg", 1, true) or string.find(n, "foot", 1, true) then return "leg" end
-    return nil
-end
-
 local chars = {}
 local selfModel = nil
 local lastRefresh = 0
-local workspacePlayers = nil
+local raycastParamsCache = nil
 
-local raycasParamsCache = nil
 local function buildRaycastParams()
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
@@ -90,67 +83,121 @@ local function buildRaycastParams()
     if selfModel then table.insert(filter, selfModel) end
     if LP.Character then table.insert(filter, LP.Character) end
     params.FilterDescendantsInstances = filter
-    raycasParamsCache = params
+    raycastParamsCache = params
     return params
+end
+
+local function volumeOf(part)
+    local s = part.Size
+    return math.max(s.X * s.Y * s.Z, 0.001)
+end
+
+local function findTagModel(folder)
+    local found = {}
+    for _, d in ipairs(folder:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "PlayerTag" then
+            local headPart = d.Parent and d.Parent.Parent
+            local model = headPart and headPart.Parent
+            if model and headPart:IsA("BasePart") and not found[model] then
+                found[model] = { model = model, head = headPart, tag = d }
+            end
+        end
+    end
+    return found
+end
+
+local function classify(ch)
+    local model, head = ch.model, ch.head
+    local folder = nil
+    for _, c in ipairs(model:GetChildren()) do
+        if c:IsA("Folder") then folder = c break end
+    end
+
+    local bodyParts = {}
+    if folder then
+        for _, c in ipairs(folder:GetChildren()) do
+            if c:IsA("BasePart") and volumeOf(c) > 0.02 then
+                table.insert(bodyParts, c)
+            end
+        end
+    end
+    if #bodyParts == 0 then
+        for _, c in ipairs(model:GetChildren()) do
+            if c:IsA("BasePart") and c ~= head then
+                table.insert(bodyParts, c)
+            end
+        end
+    end
+
+    local headPos = head.Position
+    local torso, limbs = {}, {}
+
+    local cand = {}
+    for _, p in ipairs(bodyParts) do
+        local offset = p.Position - headPos
+        local horiz = Vector2.new(offset.X, offset.Z).Magnitude
+        if offset.Magnitude >= 0.75 then
+            table.insert(cand, { part = p, vol = volumeOf(p), horiz = horiz, dy = -offset.Y })
+        end
+    end
+    table.sort(cand, function(a, b) return a.vol > b.vol end)
+    for i, c in ipairs(cand) do
+        if i <= 2 and c.horiz < 1.4 then
+            table.insert(torso, c)
+        else
+            table.insert(limbs, c)
+        end
+    end
+
+    local parts = {}
+    for _, c in ipairs(torso) do
+        table.insert(parts, { part = c.part, kind = "torso", vol = c.vol })
+    end
+    for _, c in ipairs(limbs) do
+        table.insert(parts, { part = c.part, kind = "limb", vol = c.vol })
+    end
+    ch.parts = parts
+    ch.torsoParts = torso
+    ch.allParts = bodyParts
 end
 
 local function refreshCharacters()
     local now = os.clock()
-    if now - lastRefresh < 0.2 then return end
+    if now - lastRefresh < 0.25 then return end
     lastRefresh = now
 
     local folder = workspace:FindFirstChild("Players")
-    workspacePlayers = folder
     chars = {}
     selfModel = nil
     if not folder then return end
 
-    for _, model in ipairs(folder:GetChildren()) do
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        if hum then
-            local tag, head, torso, limbs = nil, nil, nil, {}
-            local parts = {}
-            for _, d in ipairs(model:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    local kind = partKind(d.Name)
-                    if kind then
-                        table.insert(parts, {part = d, kind = kind})
-                        if kind == "head" then head = d
-                        elseif kind == "torso" then torso = d
-                        elseif kind == "arm" or kind == "leg" then table.insert(limbs, d) end
-                    end
-                elseif d:IsA("TextLabel") and d.Name == "PlayerTag" then
-                    tag = d
-                end
-            end
+    local found = findTagModel(folder)
+    for model, entry in pairs(found) do
+        local tag = entry.tag
+        local tagText = tag.Text
+        local isSelf = (LP.Character and model == LP.Character)
+            or (tagText == LP.Name or tagText == LP.DisplayName)
+        local enemy = true
+        local c = tag.TextColor3
+        enemy = c.R > c.G
 
-            local tagText = tag and tag.Text or nil
-            local isSelf = (LP.Character and model == LP.Character)
-                or (tagText and (tagText == LP.Name or tagText == LP.DisplayName))
-            local enemy = true
-            if tag then
-                local c = tag.TextColor3
-                enemy = c.R > c.G
-            elseif Settings.TeamCheck then
-                enemy = false
-            end
-
-            if isSelf then
-                selfModel = model
-            else
-                local anchor = torso or head or (parts[1] and parts[1].part)
-                table.insert(chars, {
-                    model = model,
-                    hum = hum,
-                    parts = parts,
-                    head = head,
-                    torso = torso,
-                    limbs = limbs,
-                    anchor = anchor,
-                    tagText = tagText,
-                    enemy = enemy,
-                    dead = hum.Health <= 0,
-                })
+        if isSelf then
+            selfModel = model
+        elseif enemy or not Settings.TeamCheck then
+            local ch = {
+                model = model,
+                head = entry.head,
+                tagText = tagText,
+                enemy = enemy,
+                dead = false,
+                parts = {},
+            }
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            ch.hum = hum
+            if hum and hum.Health <= 0 then ch.dead = true end
+            pcall(classify, ch)
+            if #ch.parts > 0 then
+                table.insert(chars, ch)
             end
         end
     end
@@ -168,56 +215,44 @@ end
 local function samplePoints(part)
     local cf = part.CFrame
     local size = part.Size
-    local right = cf.RightVector
-    local up = cf.UpVector
     local pts = { cf.Position }
     if size.X > 0.4 then
-        table.insert(pts, cf.Position + right * (size.X * 0.3))
-        table.insert(pts, cf.Position - right * (size.X * 0.3))
+        table.insert(pts, cf.Position + cf.RightVector * (size.X * 0.3))
+        table.insert(pts, cf.Position - cf.RightVector * (size.X * 0.3))
     end
     if size.Y > 0.4 then
-        table.insert(pts, cf.Position + up * (size.Y * 0.3))
-        table.insert(pts, cf.Position - up * (size.Y * 0.3))
+        table.insert(pts, cf.Position + cf.UpVector * (size.Y * 0.3))
+        table.insert(pts, cf.Position - cf.UpVector * (size.Y * 0.3))
     end
     return pts
+end
+
+local function pointVisible(camPos, pt, dist, params)
+    local dir = pt - camPos
+    if dir.Magnitude < 2 then return true end
+    local result = workspace:Raycast(camPos, dir, params)
+    if not result then return true end
+    return (result.Position - camPos).Magnitude >= dist - 0.25
 end
 
 local function visiblePoint(ch)
     local cam = workspace.CurrentCamera
     if not cam then return nil end
-    local params = raycasParamsCache or buildRaycastParams()
+    local params = raycastParamsCache or buildRaycastParams()
     local camPos = cam.CFrame.Position
 
-    local ordered = {}
     for _, entry in ipairs(ch.parts) do
-        if entry.kind ~= "head" then table.insert(ordered, entry) end
-    end
-    table.sort(ordered, function(a, b)
-        local rank = { torso = 1, arm = 2, leg = 3 }
-        return (rank[a.kind] or 9) < (rank[b.kind] or 9)
-    end)
-
-    for _, entry in ipairs(ordered) do
         local part = entry.part
         if part and part.Parent then
             for _, pt in ipairs(samplePoints(part)) do
-                local dir = pt - camPos
-                if dir.Magnitude > 1 then
-                    local result = workspace:Raycast(camPos, dir, params)
-                    if result and result.Instance then
-                        local hitPart = result.Instance
-                        if hitPart:IsA("BasePart") and hitPart:IsDescendantOf(ch.model) then
-                            local kind = partKind(hitPart.Name)
-                            if kind and kind ~= "head" then
-                                return {
-                                    point = result.Position,
-                                    part = hitPart,
-                                    kind = kind,
-                                    model = ch.model,
-                                }
-                            end
-                        end
-                    end
+                local dist = (pt - camPos).Magnitude
+                if dist <= Settings.MaxDistance and pointVisible(camPos, pt, dist, params) then
+                    return {
+                        point = pt,
+                        part = part,
+                        kind = entry.kind,
+                        model = ch.model,
+                    }
                 end
             end
         end
@@ -244,13 +279,22 @@ local function resolveTarget(force)
 
     local candidates = {}
     for _, ch in ipairs(chars) do
-        if ch.enemy and not ch.dead and ch.model.Parent and ch.anchor then
-            local pos = ch.anchor.Position
-            local dist = (pos - camPos).Magnitude
-            if dist <= Settings.MaxDistance then
-                local sp = project(pos)
-                if sp then
-                    table.insert(candidates, { ch = ch, screen = sp, d = (sp - center).Magnitude })
+        if ch.enemy and not ch.dead and ch.model.Parent and #ch.parts > 0 then
+            local sum, n = Vector3.zero, 0
+            for _, entry in ipairs(ch.parts) do
+                if entry.part and entry.part.Parent then
+                    sum = sum + entry.part.Position
+                    n = n + 1
+                end
+            end
+            if n > 0 then
+                local pos = sum / n
+                local dist = (pos - camPos).Magnitude
+                if dist <= Settings.MaxDistance then
+                    local sp = project(pos)
+                    if sp then
+                        table.insert(candidates, { ch = ch, d = (sp - center).Magnitude })
+                    end
                 end
             end
         end
@@ -266,7 +310,8 @@ local function resolveTarget(force)
             if sp then
                 local d = (sp - center).Magnitude
                 if d <= Settings.FOVRadius then
-                    local score = d + (hit.kind == "torso" and 0 or 40)
+                    local penalty = hit.kind == "torso" and 0 or 20
+                    local score = d + penalty
                     if not bestScore or score < bestScore then
                         best, bestScore = hit, score
                     end
@@ -440,60 +485,75 @@ local function renderESP()
     local seen = {}
     if Settings.ESP then
         for _, ch in ipairs(chars) do
-            if ch.model.Parent and ch.anchor and not ch.dead then
+            if ch.model.Parent and #ch.parts > 0 and not ch.dead then
                 seen[ch.model] = true
                 local e = espEntry(ch.model)
-                local head = ch.head
-                local torso = ch.torso or ch.anchor
                 local camPos = cam.CFrame.Position
-                local legBottom = math.huge
-                for _, entry in ipairs(ch.parts) do
-                    local p = entry.part
+                local minY, maxY = math.huge, -math.huge
+                local sum = Vector3.zero
+                local n = 0
+                for _, entry in ipairs(ch.allParts or {}) do
+                    local p = entry
                     if p and p.Parent then
-                        legBottom = math.min(legBottom, p.Position.Y - p.Size.Y / 2)
+                        minY = math.min(minY, p.Position.Y - p.Size.Y / 2)
+                        maxY = math.max(maxY, p.Position.Y + p.Size.Y / 2)
+                        sum = sum + p.Position
+                        n = n + 1
                     end
                 end
-                local topWorld = (head and head.Position or torso.Position + Vector3.new(0, 1, 0))
-                    + Vector3.new(0, (head and head.Size.Y / 2 or 0.4) + 0.3, 0)
-                local bottomWorld = Vector3.new(torso.Position.X, legBottom < math.huge
-                    and legBottom or torso.Position.Y - 1.5, torso.Position.Z)
-
-                local pTop = project(topWorld)
-                local pBot = project(bottomWorld)
-                local dist = (torso.Position - camPos).Magnitude
-                local show = pTop and pBot and dist <= Settings.MaxESP
-                if show then
-                    local h = math.abs(pBot.Y - pTop.Y)
-                    if h < 6 then h = 6 end
-                    local w = h * 0.5
-                    local x = pTop.X - w / 2
-                    local color = ch.enemy and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(90, 255, 120)
-                    if e.box then
-                        e.box.Visible = true
-                        e.box.Color = color
-                        e.box.Position = Vector2.new(x, pTop.Y)
-                        e.box.Size = Vector2.new(w, h)
-                    end
-                    if e.name then
-                        e.name.Visible = true
-                        e.name.Text = string.format("%s [%d]", ch.tagText or ch.model.Name, math.floor(dist))
-                        e.name.Color = color
-                        e.name.Position = Vector2.new(pTop.X, pTop.Y - 16)
-                    end
-                    if e.hp then
-                        local frac = 0
-                        if ch.hum and ch.hum.MaxHealth > 0 then
-                            frac = math.clamp(ch.hum.Health / ch.hum.MaxHealth, 0, 1)
+                if n == 0 then
+                    for _, entry in ipairs(ch.parts) do
+                        local p = entry.part
+                        if p and p.Parent then
+                            minY = math.min(minY, p.Position.Y - p.Size.Y / 2)
+                            maxY = math.max(maxY, p.Position.Y + p.Size.Y / 2)
+                            sum = sum + p.Position
+                            n = n + 1
                         end
-                        e.hp.Visible = true
-                        e.hp.Color = Color3.fromRGB(math.floor(255 * (1 - frac)), math.floor(255 * frac), 60)
-                        e.hp.Position = Vector2.new(x + 2, pTop.Y + h + 3)
-                        e.hp.Size = Vector2.new((w - 4) * frac, 2)
                     end
-                else
-                    if e.box then e.box.Visible = false end
-                    if e.name then e.name.Visible = false end
-                    if e.hp then e.hp.Visible = false end
+                end
+                if n > 0 then
+                    local centroid = sum / n
+                    local topWorld = Vector3.new(centroid.X, maxY + 0.35, centroid.Z)
+                    local bottomWorld = Vector3.new(centroid.X, minY, centroid.Z)
+                    local pTop = project(topWorld)
+                    local pBot = project(bottomWorld)
+                    local dist = (centroid - camPos).Magnitude
+                    local show = pTop and pBot and dist <= Settings.MaxESP
+                    if show then
+                        local h = math.abs(pBot.Y - pTop.Y)
+                        if h < 8 then h = 8 end
+                        local w = h * 0.5
+                        local x = pTop.X - w / 2
+                        local color = Color3.fromRGB(255, 70, 70)
+                        if e.box then
+                            e.box.Visible = true
+                            e.box.Color = color
+                            e.box.Position = Vector2.new(x, pTop.Y)
+                            e.box.Size = Vector2.new(w, h)
+                        end
+                        if e.name then
+                            e.name.Visible = true
+                            e.name.Text = string.format("%s [%d]", ch.tagText or ch.model.Name, math.floor(dist))
+                            e.name.Color = color
+                            e.name.Position = Vector2.new(pTop.X, pTop.Y - 16)
+                        end
+                        if e.hp then
+                            if ch.hum and ch.hum.MaxHealth > 0 then
+                                local frac = math.clamp(ch.hum.Health / ch.hum.MaxHealth, 0, 1)
+                                e.hp.Visible = true
+                                e.hp.Color = Color3.fromRGB(math.floor(255 * (1 - frac)), math.floor(255 * frac), 60)
+                                e.hp.Position = Vector2.new(x + 2, pTop.Y + h + 3)
+                                e.hp.Size = Vector2.new((w - 4) * frac, 2)
+                            else
+                                e.hp.Visible = false
+                            end
+                        end
+                    else
+                        if e.box then e.box.Visible = false end
+                        if e.name then e.name.Visible = false end
+                        if e.hp then e.hp.Visible = false end
+                    end
                 end
             end
         end
@@ -566,12 +626,8 @@ task.spawn(function()
     while S.alive() do
         pcall(refreshCharacters)
         pcall(function()
-            Status.enemies = 0
-            for _, ch in ipairs(chars) do
-                if ch.enemy and not ch.dead then
-                    Status.enemies = Status.enemies + 1
-                end
-            end
+            Status.players = #chars
+            Status.enemies = #chars
         end)
         pcall(resolveTarget, false)
         task.wait(0.2)
