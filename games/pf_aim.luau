@@ -22,9 +22,10 @@ if getgenv().pfAimCleanup then pcall(getgenv().pfAimCleanup) end
 local Settings = {
     Enabled = true,
     Assist = true,
-    AssistGain = 0.18,
-    AssistMaxStep = 22,
-    AssistDeadzone = 2,
+    AssistGain = 0.22,
+    AssistMaxStep = 36,
+    AssistDeadzone = 1.5,
+    Predict = 0.06,
     ESP = true,
     FOVCircle = true,
     FOVRadius = 200,
@@ -327,6 +328,7 @@ local function visiblePoint(ch)
                 if dist <= Settings.MaxDistance and pointVisible(camPos, pt, dist, params) then
                     return {
                         point = pt,
+                        aim = part.CFrame.Position,
                         part = part,
                         kind = entry.kind,
                         model = ch.model,
@@ -450,6 +452,7 @@ local function resolveTarget(force)
             if entry and entry.part and entry.part.Parent then
                 best = {
                     point = entry.part.CFrame.Position,
+                    aim = entry.part.CFrame.Position,
                     part = entry.part,
                     kind = entry.kind,
                     model = fb.model,
@@ -724,19 +727,42 @@ end)
 local assistSign = 1
 local lastErr = nil
 local badFrames = 0
+local lastAimModel = nil
+local lastAimScreen = nil
+local lastAimTime = 0
+local aimVelX, aimVelY = 0, 0
 
 local function assistStep()
     if not (Settings.Enabled and Settings.Assist and firing) then
         lastErr, badFrames = nil, 0
+        lastAimModel, lastAimScreen = nil, nil
+        aimVelX, aimVelY = 0, 0
         return
     end
     local target = resolveTarget(false)
     if not target or target.wall then return end
-    local sp = project(target.point)
+    local aimWorld = target.aim or target.point
+    local sp = project(aimWorld)
     if not sp then return end
+    local now = os.clock()
+    if lastAimModel == target.model and lastAimScreen and now > lastAimTime then
+        local dt = now - lastAimTime
+        if dt > 0 and dt < 0.25 then
+            local vx = (sp.X - lastAimScreen.X) / dt
+            local vy = (sp.Y - lastAimScreen.Y) / dt
+            aimVelX = aimVelX * 0.5 + vx * 0.5
+            aimVelY = aimVelY * 0.5 + vy * 0.5
+        end
+    else
+        aimVelX, aimVelY = 0, 0
+    end
+    lastAimModel, lastAimScreen, lastAimTime = target.model, sp, now
+
+    local px = sp.X + aimVelX * Settings.Predict
+    local py = sp.Y + aimVelY * Settings.Predict
     local center = screenCenter()
-    local dx = (sp.X - center.X) * assistSign
-    local dy = (sp.Y - center.Y) * assistSign
+    local dx = (px - center.X) * assistSign
+    local dy = (py - center.Y) * assistSign
     local err = math.sqrt(dx * dx + dy * dy)
 
     if lastErr and err > lastErr * 1.25 + 8 then
@@ -752,6 +778,7 @@ local function assistStep()
         return
     end
     lastErr = err
+    Status.aimErr = err
 
     local dead = Settings.AssistDeadzone or 2
     if math.abs(dx) + math.abs(dy) < dead then return end
