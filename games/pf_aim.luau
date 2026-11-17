@@ -430,8 +430,8 @@ local function resolveTarget(force)
                 fb, fbD = c.ch, c.d
             end
         end
-        if fb and fbD and Settings.AutoFOV and fbD <= cap then
-            gate = math.min(fbD, cap)
+        if fb and fbD and Settings.AutoFOV and fbD > gate and fbD <= cap then
+            gate = fbD
         end
         if fb and fbD and fbD <= gate then
             local entry = fb.parts[1]
