@@ -498,10 +498,6 @@ local function patchSend(self, args)
 
     if name == "newbullets" then
         if not (Settings.Enabled and Settings.SilentAim) then return false end
-        local char = LP.Character
-        if not char then return false end
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if not hum or hum.Health <= 0 then return false end
         local target = resolveTarget(true)
         if not target then return false end
         if not target.player then Status.mapFail = Status.mapFail + 1 end
