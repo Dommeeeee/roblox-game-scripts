@@ -1,9 +1,9 @@
 -- Phantom Forces aim kit: body-first targeting with visible-part priority (no head),
--- Drawing ESP + FOV circle, and an optional trigger-time mouse assist.
+-- ESP + FOV ring rendered as Roblox GUI so placement is DPI- and executor-independent,
+-- and an optional trigger-time mouse assist.
 -- Camera is never written directly; assist moves the real mouse only while firing.
 -- PF v3231 runs its client framework inside Actor VMs, so remote/module hooks
--- from the main VM cannot reach the bullet pipeline; silent-aim wiring is omitted
--- rather than shipped dead.
+-- from the main VM cannot reach the bullet pipeline.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -33,7 +33,6 @@ local Settings = {
     Lead = true,
     BulletSpeed = 900,
     LeadCap = 0.45,
-    ScreenScale = 0,
 }
 
 local Status = {
@@ -47,8 +46,7 @@ local Status = {
     lockedPart = nil,
     lockedKind = nil,
     assistFrames = 0,
-    scale = 1,
-    cross = "0,0",
+    view = "0,0",
     error = nil,
 }
 getgenv().PFAimStatus = Status
@@ -61,13 +59,15 @@ local function connect(sig, fn)
     return conn
 end
 
-local drawings = {}
-local function newDrawing(cls)
-    if typeof(Drawing) ~= "table" and typeof(Drawing) ~= "userdata" then return nil end
-    local ok, d = pcall(Drawing.new, cls)
-    if not ok or not d then return nil end
-    table.insert(drawings, d)
-    return d
+local playerGui = LP:FindFirstChildOfClass("PlayerGui")
+
+local function screenSize()
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize
+    if vp and vp.X > 1 and vp.Y > 1 then return vp end
+    local hud = playerGui and playerGui:FindFirstChild("HudScreenGui")
+    if hud and hud.AbsoluteSize.X > 1 then return hud.AbsoluteSize end
+    return Vector2.new(1920, 1080)
 end
 
 local chars = {}
@@ -204,76 +204,24 @@ local function refreshCharacters()
     buildRaycastParams()
 end
 
-local function guiScale()
-    if Settings.ScreenScale and Settings.ScreenScale > 0 then
-        return Settings.ScreenScale
-    end
-    local cam = workspace.CurrentCamera
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    local hud = pg and pg:FindFirstChild("HudScreenGui")
-    if cam and hud then
-        local vp = cam.ViewportSize
-        local abs = hud.AbsoluteSize
-        if vp.X > 0 and abs.X > 0 then
-            local ratio = abs.X / vp.X
-            if math.abs(ratio - 1) > 0.02 then
-                return ratio
-            end
-        end
-    end
-    return 1
-end
-
-local crossCache, crossAt = nil, 0
-local function crosshairPos()
-    local now = os.clock()
-    if crossCache and now - crossAt < 0.5 then return crossCache end
-    local cam = workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize or Vector2.new(960, 540)
-    local sc = guiScale()
-    local pos = Vector2.new(vp.X / 2 * sc, vp.Y / 2 * sc)
-
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    local hud = pg and pg:FindFirstChild("HudScreenGui")
-    if hud then
-        local best, bestD = nil, nil
-        for _, d in ipairs(hud:GetDescendants()) do
-            if d:IsA("TextLabel") and d.Name == "TextCross" then
-                local p, s = d.AbsolutePosition, d.AbsoluteSize
-                if p.X > 0 and p.Y > 0 then
-                    local c = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
-                    local dist = (c - pos).Magnitude
-                    if not bestD or dist < bestD then
-                        best, bestD = c, dist
-                    end
-                end
-            end
-        end
-        local limit = math.min(vp.X, vp.Y) * sc * 0.15
-        if best and bestD and bestD <= limit then
-            pos = best
-        end
-    end
-    crossCache, crossAt = pos, now
-    Status.cross = tostring(pos)
-    return pos
-end
-
-local function fovRadiusPx()
-    local cam = workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-    local base = vp.Y / 1080
-    if base <= 0 then base = 1 end
-    return Settings.FOVRadius * base * guiScale()
-end
-
 local function project(pos)
     local cam = workspace.CurrentCamera
     if not cam then return nil end
     local sp, on = cam:WorldToViewportPoint(pos)
     if not on or sp.Z <= 0 then return nil end
-    local sc = guiScale()
-    return Vector2.new(sp.X * sc, sp.Y * sc)
+    return Vector2.new(sp.X, sp.Y)
+end
+
+local function screenCenter()
+    local vp = screenSize()
+    return Vector2.new(vp.X / 2, vp.Y / 2)
+end
+
+local function fovRadiusPx()
+    local vp = screenSize()
+    local base = vp.Y / 1080
+    if base <= 0 then base = 1 end
+    return Settings.FOVRadius * base
 end
 
 local function samplePoints(part)
@@ -335,11 +283,9 @@ local function resolveTarget(force)
     lastResolve = now
     cachedTarget = nil
 
-    local cam = workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize or nil
-    if not cam or not vp or vp.X <= 0 or vp.Y <= 0 then return nil end
-    local center = crosshairPos()
-    local camPos = cam.CFrame.Position
+    local center = screenCenter()
+    local camPos = Camera.CFrame.Position
+    local fovPx = fovRadiusPx()
 
     local candidates = {}
     for _, ch in ipairs(chars) do
@@ -366,7 +312,6 @@ local function resolveTarget(force)
     table.sort(candidates, function(a, b) return a.d < b.d end)
 
     local best, bestScore = nil, nil
-    local fovPx = fovRadiusPx()
     for i = 1, math.min(#candidates, 4) do
         local ch = candidates[i].ch
         local hit = visiblePoint(ch)
@@ -404,13 +349,225 @@ local function assistPoint(itarget)
         local part = itarget.part
         local vel = part.AssemblyLinearVelocity or part.Velocity
         if vel and vel.Magnitude > 2 then
-            local camPos = Camera.CFrame.Position
-            local dist = (aim - camPos).Magnitude
+            local cpos = Camera.CFrame.Position
+            local dist = (aim - cpos).Magnitude
             local t = math.min(dist / math.max(Settings.BulletSpeed, 1), Settings.LeadCap)
             aim = aim + vel * t
         end
     end
     return aim
+end
+
+local gui = nil
+local ring = nil
+local ringStroke = nil
+local hudLine = nil
+local hudLock = nil
+local esp = {}
+
+local function ensureGui()
+    if gui and gui.Parent then return end
+    if not playerGui then return end
+    gui = Instance.new("ScreenGui")
+    gui.Name = "pfAimOverlay"
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 100
+    gui.ResetOnSpawn = false
+    gui.Parent = playerGui
+
+    ring = Instance.new("Frame")
+    ring.Name = "fovRing"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Position = UDim2.fromScale(0.5, 0.5)
+    ring.BackgroundTransparency = 1
+    ring.BorderSizePixel = 0
+    ring.Size = UDim2.fromOffset(320, 320)
+    ring.Parent = gui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0.5, 0)
+    corner.Parent = ring
+    ringStroke = Instance.new("UIStroke")
+    ringStroke.Thickness = 1
+    ringStroke.Transparency = 0.5
+    ringStroke.Color = Color3.fromRGB(235, 235, 235)
+    ringStroke.Parent = ring
+
+    hudLine = Instance.new("TextLabel")
+    hudLine.BackgroundTransparency = 1
+    hudLine.Position = UDim2.fromOffset(18, 14)
+    hudLine.Size = UDim2.fromOffset(760, 18)
+    hudLine.Font = Enum.Font.SourceSansSemibold
+    hudLine.TextSize = 15
+    hudLine.TextXAlignment = Enum.TextXAlignment.Left
+    hudLine.TextColor3 = Color3.fromRGB(220, 220, 220)
+    hudLine.TextStrokeTransparency = 0.3
+    hudLine.Text = "pf aim"
+    hudLine.Parent = gui
+
+    hudLock = Instance.new("TextLabel")
+    hudLock.BackgroundTransparency = 1
+    hudLock.Position = UDim2.fromOffset(18, 34)
+    hudLock.Size = UDim2.fromOffset(760, 18)
+    hudLock.Font = Enum.Font.SourceSansSemibold
+    hudLock.TextSize = 14
+    hudLock.TextXAlignment = Enum.TextXAlignment.Left
+    hudLock.TextColor3 = Color3.fromRGB(255, 210, 60)
+    hudLock.TextStrokeTransparency = 0.3
+    hudLock.Text = ""
+    hudLock.Parent = gui
+end
+
+local function espEntry(model)
+    local e = esp[model]
+    if e and e.box and e.box.Parent then return e end
+    ensureGui()
+    if not gui then return nil end
+    e = {
+        box = Instance.new("Frame"),
+        name = Instance.new("TextLabel"),
+        hp = Instance.new("Frame"),
+    }
+    e.box.Name = "espBox"
+    e.box.BackgroundTransparency = 1
+    e.box.BorderSizePixel = 0
+    e.box.Parent = gui
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(255, 70, 70)
+    stroke.Parent = e.box
+    e.boxStroke = stroke
+
+    e.name.Name = "espName"
+    e.name.BackgroundTransparency = 1
+    e.name.AnchorPoint = Vector2.new(0.5, 1)
+    e.name.Font = Enum.Font.SourceSansSemibold
+    e.name.TextSize = 13
+    e.name.TextColor3 = Color3.fromRGB(255, 70, 70)
+    e.name.TextStrokeTransparency = 0.2
+    e.name.Parent = gui
+
+    e.hp.Name = "espHp"
+    e.hp.BackgroundColor3 = Color3.fromRGB(60, 255, 60)
+    e.hp.BorderSizePixel = 0
+    e.hp.Parent = gui
+
+    esp[model] = e
+    return e
+end
+
+local function destroyEsp(model)
+    local e = esp[model]
+    if not e then return end
+    for _, d in pairs(e) do
+        if typeof(d) == "Instance" then
+            pcall(function() d:Destroy() end)
+        end
+    end
+    esp[model] = nil
+end
+
+local function renderOverlay()
+    ensureGui()
+    if not gui then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local center = screenCenter()
+    local fovPx = fovRadiusPx()
+    Status.view = tostring(screenSize())
+
+    if ring then
+        ring.Visible = Settings.FOVCircle
+        if Settings.FOVCircle then
+            ring.Position = UDim2.fromScale(0.5, 0.5)
+            ring.Size = UDim2.fromOffset(fovPx * 2, fovPx * 2)
+            ringStroke.Color = cachedTarget and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(235, 235, 235)
+        end
+    end
+
+    local seen = {}
+    if Settings.ESP then
+        for _, ch in ipairs(chars) do
+            if ch.model.Parent and #ch.parts > 0 and not ch.dead then
+                seen[ch.model] = true
+                local e = espEntry(ch.model)
+                if e then
+                    local camPos = cam.CFrame.Position
+                    local minY, maxY = math.huge, -math.huge
+                    local sum = Vector3.zero
+                    local n = 0
+                    for _, p in ipairs(ch.allParts or {}) do
+                        if p and p.Parent then
+                            minY = math.min(minY, p.Position.Y - p.Size.Y / 2)
+                            maxY = math.max(maxY, p.Position.Y + p.Size.Y / 2)
+                            sum = sum + p.Position
+                            n = n + 1
+                        end
+                    end
+                    if n > 0 then
+                        local centroid = sum / n
+                        local pTop = project(Vector3.new(centroid.X, maxY + 0.35, centroid.Z))
+                        local pBot = project(Vector3.new(centroid.X, minY, centroid.Z))
+                        local dist = (centroid - camPos).Magnitude
+                        local show = pTop and pBot and dist <= Settings.MaxESP
+                        if show then
+                            local h = math.abs(pBot.Y - pTop.Y)
+                            if h < 8 then h = 8 end
+                            local w = h * 0.5
+                            local x = pTop.X - w / 2
+                            e.box.Visible = true
+                            e.box.Position = UDim2.fromOffset(x, pTop.Y)
+                            e.box.Size = UDim2.fromOffset(w, h)
+
+                            e.name.Visible = true
+                            e.name.Text = string.format("%s [%d]", ch.tagText or ch.model.Name, math.floor(dist))
+                            e.name.Position = UDim2.fromOffset(pTop.X, pTop.Y - 2)
+
+                            if ch.hum and ch.hum.MaxHealth > 0 then
+                                local frac = math.clamp(ch.hum.Health / ch.hum.MaxHealth, 0, 1)
+                                e.hp.Visible = true
+                                e.hp.BackgroundColor3 = Color3.fromRGB(math.floor(255 * (1 - frac)), math.floor(255 * frac), 60)
+                                e.hp.Position = UDim2.fromOffset(x + 2, pTop.Y + h + 3)
+                                e.hp.Size = UDim2.fromOffset((w - 4) * frac, 2)
+                            else
+                                e.hp.Visible = false
+                            end
+                        else
+                            e.box.Visible = false
+                            e.name.Visible = false
+                            e.hp.Visible = false
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for model, e in pairs(esp) do
+        if not seen[model] then
+            if e.box then e.box.Visible = false end
+            if e.name then e.name.Visible = false end
+            if e.hp then e.hp.Visible = false end
+            if not model.Parent then
+                destroyEsp(model)
+            end
+        end
+    end
+
+    if hudLine then
+        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx | view %s",
+            Settings.Enabled and "on" or "off",
+            Settings.ESP and "on" or "off",
+            Settings.Assist and "on" or "off",
+            math.floor(fovPx),
+            Status.view)
+    end
+    if hudLock then
+        if cachedTarget then
+            hudLock.Text = string.format("lock: %s : %s", tostring(Status.lockedModel), tostring(Status.lockedKind))
+        else
+            hudLock.Text = ""
+        end
+    end
 end
 
 local firing = false
@@ -430,200 +587,21 @@ connect(UIS.InputBegan, function(input, gp)
     elseif key == Enum.KeyCode.F5 then
         Settings.Assist = not Settings.Assist
         Status.assist = Settings.Assist
-    elseif key == Enum.KeyCode.F6 then
-        local steps = { 0, 1, 0.75, 0.5, 1.25, 1.5, 2, 3 }
-        local idx = 1
-        for i, v in ipairs(steps) do
-            if v == Settings.ScreenScale then idx = i break end
-        end
-        Settings.ScreenScale = steps[(idx % #steps) + 1]
     end
 end)
 connect(UIS.InputEnded, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then firing = false end
 end)
 
-local esp = {}
-local fovCircle = newDrawing("Circle")
-if fovCircle then
-    fovCircle.Thickness = 1
-    fovCircle.Transparency = 0.5
-    fovCircle.Color = Color3.fromRGB(235, 235, 235)
-    fovCircle.NumSides = 48
-    fovCircle.Visible = Settings.FOVCircle
-end
-local hudLine = newDrawing("Text")
-if hudLine then
-    hudLine.Size = 15
-    hudLine.Color = Color3.fromRGB(220, 220, 220)
-    hudLine.Font = 2
-    hudLine.Position = Vector2.new(18, 18)
-    hudLine.Text = "pf aim"
-    hudLine.Outline = true
-    hudLine.OutlineColor = Color3.new(0, 0, 0)
-end
-local hudLock = newDrawing("Text")
-if hudLock then
-    hudLock.Size = 14
-    hudLock.Color = Color3.fromRGB(255, 210, 60)
-    hudLock.Font = 2
-    hudLock.Position = Vector2.new(18, 38)
-    hudLock.Text = ""
-    hudLock.Outline = true
-    hudLock.OutlineColor = Color3.new(0, 0, 0)
-end
-
-local function espEntry(model)
-    local e = esp[model]
-    if not e then
-        e = {
-            box = newDrawing("Square"),
-            name = newDrawing("Text"),
-            hp = newDrawing("Square"),
-        }
-        if e.box then
-            e.box.Thickness = 1
-            e.box.Filled = false
-        end
-        if e.name then
-            e.name.Size = 13
-            e.name.Font = 2
-            e.name.Outline = true
-            e.name.OutlineColor = Color3.new(0, 0, 0)
-            e.name.Center = true
-        end
-        if e.hp then
-            e.hp.Thickness = 0
-            e.hp.Filled = true
-        end
-        esp[model] = e
-    end
-    return e
-end
-
-local function renderESP()
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local seen = {}
-    if Settings.ESP then
-        for _, ch in ipairs(chars) do
-            if ch.model.Parent and #ch.parts > 0 and not ch.dead then
-                seen[ch.model] = true
-                local e = espEntry(ch.model)
-                local camPos = cam.CFrame.Position
-                local minY, maxY = math.huge, -math.huge
-                local sum = Vector3.zero
-                local n = 0
-                for _, p in ipairs(ch.allParts or {}) do
-                    if p and p.Parent then
-                        minY = math.min(minY, p.Position.Y - p.Size.Y / 2)
-                        maxY = math.max(maxY, p.Position.Y + p.Size.Y / 2)
-                        sum = sum + p.Position
-                        n = n + 1
-                    end
-                end
-                if n > 0 then
-                    local centroid = sum / n
-                    local pTop = project(Vector3.new(centroid.X, maxY + 0.35, centroid.Z))
-                    local pBot = project(Vector3.new(centroid.X, minY, centroid.Z))
-                    local dist = (centroid - camPos).Magnitude
-                    local show = pTop and pBot and dist <= Settings.MaxESP
-                    if show then
-                        local h = math.abs(pBot.Y - pTop.Y)
-                        if h < 8 then h = 8 end
-                        local w = h * 0.5
-                        local x = pTop.X - w / 2
-                        local color = Color3.fromRGB(255, 70, 70)
-                        if e.box then
-                            e.box.Visible = true
-                            e.box.Color = color
-                            e.box.Position = Vector2.new(x, pTop.Y)
-                            e.box.Size = Vector2.new(w, h)
-                        end
-                        if e.name then
-                            e.name.Visible = true
-                            e.name.Text = string.format("%s [%d]", ch.tagText or ch.model.Name, math.floor(dist))
-                            e.name.Color = color
-                            e.name.Position = Vector2.new(pTop.X, pTop.Y - 16)
-                        end
-                        if e.hp then
-                            if ch.hum and ch.hum.MaxHealth > 0 then
-                                local frac = math.clamp(ch.hum.Health / ch.hum.MaxHealth, 0, 1)
-                                e.hp.Visible = true
-                                e.hp.Color = Color3.fromRGB(math.floor(255 * (1 - frac)), math.floor(255 * frac), 60)
-                                e.hp.Position = Vector2.new(x + 2, pTop.Y + h + 3)
-                                e.hp.Size = Vector2.new((w - 4) * frac, 2)
-                            else
-                                e.hp.Visible = false
-                            end
-                        end
-                    else
-                        if e.box then e.box.Visible = false end
-                        if e.name then e.name.Visible = false end
-                        if e.hp then e.hp.Visible = false end
-                    end
-                end
-            end
-        end
-    end
-    for model, e in pairs(esp) do
-        if not seen[model] then
-            if e.box then e.box.Visible = false end
-            if e.name then e.name.Visible = false end
-            if e.hp then e.hp.Visible = false end
-            if not model.Parent then
-                for _, d in pairs(e) do
-                    if d and d.Remove then pcall(d.Remove, d) end
-                end
-                esp[model] = nil
-            end
-        end
-    end
-
-    local vp = cam.ViewportSize
-    local fovPx = fovRadiusPx()
-    Status.fovPx = fovPx
-    if fovCircle then
-        fovCircle.Visible = Settings.FOVCircle
-        if Settings.FOVCircle then
-            local center = crosshairPos()
-            fovCircle.Center = center
-            fovCircle.Radius = fovPx
-            fovCircle.Color = cachedTarget and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(235, 235, 235)
-        end
-    end
-    local scale = guiScale()
-    Status.scale = scale
-    if hudLine then
-        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx | scale %.2f (F6)",
-            Settings.Enabled and "on" or "off",
-            Settings.ESP and "on" or "off",
-            Settings.Assist and "on" or "off",
-            math.floor(fovPx),
-            scale)
-    end
-    if hudLock then
-        if cachedTarget then
-            hudLock.Text = string.format("lock: %s : %s", tostring(Status.lockedModel), tostring(Status.lockedKind))
-        else
-            hudLock.Text = ""
-        end
-    end
-end
-
 local function assistStep()
     if not (Settings.Enabled and Settings.Assist and firing) then return end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
     local target = resolveTarget(false)
     if not target then return end
     local sp = project(assistPoint(target))
     if not sp then return end
-    local center = crosshairPos()
-    local scale = guiScale()
-    if scale <= 0 then scale = 1 end
-    local dx = (sp.X - center.X) / scale
-    local dy = (sp.Y - center.Y) / scale
+    local center = screenCenter()
+    local dx = sp.X - center.X
+    local dy = sp.Y - center.Y
     if math.abs(dx) + math.abs(dy) < 1.5 then return end
     local gain = Settings.AssistGain
     local stepX = math.clamp(dx * gain, -Settings.AssistMaxStep, Settings.AssistMaxStep)
@@ -633,7 +611,7 @@ local function assistStep()
 end
 
 connect(RunService.RenderStepped, function()
-    pcall(renderESP)
+    pcall(renderOverlay)
     pcall(assistStep)
 end)
 
@@ -669,10 +647,14 @@ local function cleanup()
         pcall(function() conn:Disconnect() end)
     end
     connections = {}
-    for _, d in ipairs(drawings) do
-        pcall(function() d:Remove() end)
+    for model in pairs(esp) do
+        destroyEsp(model)
     end
-    drawings = {}
+    esp = {}
+    if gui then
+        pcall(function() gui:Destroy() end)
+        gui = nil
+    end
     getgenv().pfAimCleanup = nil
     getgenv().PFAimStatus = nil
 end
