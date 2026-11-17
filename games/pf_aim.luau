@@ -228,23 +228,31 @@ local crossCache, crossAt = nil, 0
 local function crosshairPos()
     local now = os.clock()
     if crossCache and now - crossAt < 0.5 then return crossCache end
-    local pos = nil
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(960, 540)
+    local sc = guiScale()
+    local pos = Vector2.new(vp.X / 2 * sc, vp.Y / 2 * sc)
+
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     local hud = pg and pg:FindFirstChild("HudScreenGui")
     if hud then
-        local cross = hud:FindFirstChild("TextCross", true)
-        if cross and cross:IsA("TextLabel") then
-            local p, s = cross.AbsolutePosition, cross.AbsoluteSize
-            if p.X > 0 or p.Y > 0 then
-                pos = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
+        local best, bestD = nil, nil
+        for _, d in ipairs(hud:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Name == "TextCross" then
+                local p, s = d.AbsolutePosition, d.AbsoluteSize
+                if p.X > 0 and p.Y > 0 then
+                    local c = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
+                    local dist = (c - pos).Magnitude
+                    if not bestD or dist < bestD then
+                        best, bestD = c, dist
+                    end
+                end
             end
         end
-    end
-    if not pos then
-        local cam = workspace.CurrentCamera
-        local vp = cam and cam.ViewportSize or Vector2.new(960, 540)
-        local sc = guiScale()
-        pos = Vector2.new(vp.X / 2 * sc, vp.Y / 2 * sc)
+        local limit = math.min(vp.X, vp.Y) * sc * 0.15
+        if best and bestD and bestD <= limit then
+            pos = best
+        end
     end
     crossCache, crossAt = pos, now
     Status.cross = tostring(pos)
@@ -414,7 +422,7 @@ connect(UIS.InputBegan, function(input, gp)
         Settings.Assist = not Settings.Assist
         Status.assist = Settings.Assist
     elseif key == Enum.KeyCode.F6 then
-        local steps = { 0, 1, 0.75, 0.5, 1.25, 1.5, 2 }
+        local steps = { 0, 1, 0.75, 0.5, 1.25, 1.5, 2, 3 }
         local idx = 1
         for i, v in ipairs(steps) do
             if v == Settings.ScreenScale then idx = i break end
