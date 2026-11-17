@@ -259,6 +259,14 @@ local function crosshairPos()
     return pos
 end
 
+local function fovRadiusPx()
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local base = vp.Y / 1080
+    if base <= 0 then base = 1 end
+    return Settings.FOVRadius * base * guiScale()
+end
+
 local function project(pos)
     local cam = workspace.CurrentCamera
     if not cam then return nil end
@@ -358,6 +366,7 @@ local function resolveTarget(force)
     table.sort(candidates, function(a, b) return a.d < b.d end)
 
     local best, bestScore = nil, nil
+    local fovPx = fovRadiusPx()
     for i = 1, math.min(#candidates, 4) do
         local ch = candidates[i].ch
         local hit = visiblePoint(ch)
@@ -365,7 +374,7 @@ local function resolveTarget(force)
             local sp = project(hit.point)
             if sp then
                 local d = (sp - center).Magnitude
-                if d <= Settings.FOVRadius then
+                if d <= fovPx then
                     local penalty = hit.kind == "torso" and 0 or 20
                     local score = d + penalty
                     if not bestScore or score < bestScore then
@@ -572,23 +581,25 @@ local function renderESP()
     end
 
     local vp = cam.ViewportSize
+    local fovPx = fovRadiusPx()
+    Status.fovPx = fovPx
     if fovCircle then
         fovCircle.Visible = Settings.FOVCircle
         if Settings.FOVCircle then
             local center = crosshairPos()
             fovCircle.Center = center
-            fovCircle.Radius = Settings.FOVRadius
+            fovCircle.Radius = fovPx
             fovCircle.Color = cachedTarget and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(235, 235, 235)
         end
     end
     local scale = guiScale()
     Status.scale = scale
     if hudLine then
-        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %d | scale %.2f (F6)",
+        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %dpx | scale %.2f (F6)",
             Settings.Enabled and "on" or "off",
             Settings.ESP and "on" or "off",
             Settings.Assist and "on" or "off",
-            Settings.FOVRadius,
+            math.floor(fovPx),
             scale)
     end
     if hudLock then
