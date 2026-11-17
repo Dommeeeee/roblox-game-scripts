@@ -33,6 +33,7 @@ local Settings = {
     Lead = true,
     BulletSpeed = 900,
     LeadCap = 0.45,
+    ScreenScale = 0,
 }
 
 local Status = {
@@ -46,6 +47,8 @@ local Status = {
     lockedPart = nil,
     lockedKind = nil,
     assistFrames = 0,
+    scale = 1,
+    cross = "0,0",
     error = nil,
 }
 getgenv().PFAimStatus = Status
@@ -201,12 +204,60 @@ local function refreshCharacters()
     buildRaycastParams()
 end
 
+local function guiScale()
+    if Settings.ScreenScale and Settings.ScreenScale > 0 then
+        return Settings.ScreenScale
+    end
+    local cam = workspace.CurrentCamera
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local hud = pg and pg:FindFirstChild("HudScreenGui")
+    if cam and hud then
+        local vp = cam.ViewportSize
+        local abs = hud.AbsoluteSize
+        if vp.X > 0 and abs.X > 0 then
+            local ratio = abs.X / vp.X
+            if math.abs(ratio - 1) > 0.02 then
+                return ratio
+            end
+        end
+    end
+    return 1
+end
+
+local crossCache, crossAt = nil, 0
+local function crosshairPos()
+    local now = os.clock()
+    if crossCache and now - crossAt < 0.5 then return crossCache end
+    local pos = nil
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    local hud = pg and pg:FindFirstChild("HudScreenGui")
+    if hud then
+        local cross = hud:FindFirstChild("TextCross", true)
+        if cross and cross:IsA("TextLabel") then
+            local p, s = cross.AbsolutePosition, cross.AbsoluteSize
+            if p.X > 0 or p.Y > 0 then
+                pos = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
+            end
+        end
+    end
+    if not pos then
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(960, 540)
+        local sc = guiScale()
+        pos = Vector2.new(vp.X / 2 * sc, vp.Y / 2 * sc)
+    end
+    crossCache, crossAt = pos, now
+    Status.cross = tostring(pos)
+    return pos
+end
+
 local function project(pos)
     local cam = workspace.CurrentCamera
     if not cam then return nil end
     local sp, on = cam:WorldToViewportPoint(pos)
     if not on or sp.Z <= 0 then return nil end
-    return Vector2.new(sp.X, sp.Y)
+    local sc = guiScale()
+    return Vector2.new(sp.X * sc, sp.Y * sc)
 end
 
 local function samplePoints(part)
@@ -271,7 +322,7 @@ local function resolveTarget(force)
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or nil
     if not cam or not vp or vp.X <= 0 or vp.Y <= 0 then return nil end
-    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    local center = crosshairPos()
     local camPos = cam.CFrame.Position
 
     local candidates = {}
@@ -362,6 +413,13 @@ connect(UIS.InputBegan, function(input, gp)
     elseif key == Enum.KeyCode.F5 then
         Settings.Assist = not Settings.Assist
         Status.assist = Settings.Assist
+    elseif key == Enum.KeyCode.F6 then
+        local steps = { 0, 1, 0.75, 0.5, 1.25, 1.5, 2 }
+        local idx = 1
+        for i, v in ipairs(steps) do
+            if v == Settings.ScreenScale then idx = i break end
+        end
+        Settings.ScreenScale = steps[(idx % #steps) + 1]
     end
 end)
 connect(UIS.InputEnded, function(input)
@@ -509,17 +567,21 @@ local function renderESP()
     if fovCircle then
         fovCircle.Visible = Settings.FOVCircle
         if Settings.FOVCircle then
-            fovCircle.Center = Vector2.new(vp.X / 2, vp.Y / 2)
+            local center = crosshairPos()
+            fovCircle.Center = center
             fovCircle.Radius = Settings.FOVRadius
             fovCircle.Color = cachedTarget and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(235, 235, 235)
         end
     end
+    local scale = guiScale()
+    Status.scale = scale
     if hudLine then
-        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %d",
+        hudLine.Text = string.format("pf aim %s | esp %s | assist %s (F5) | fov %d | scale %.2f (F6)",
             Settings.Enabled and "on" or "off",
             Settings.ESP and "on" or "off",
             Settings.Assist and "on" or "off",
-            Settings.FOVRadius)
+            Settings.FOVRadius,
+            scale)
     end
     if hudLock then
         if cachedTarget then
@@ -538,9 +600,11 @@ local function assistStep()
     if not target then return end
     local sp = project(assistPoint(target))
     if not sp then return end
-    local vp = cam.ViewportSize
-    local dx = sp.X - vp.X / 2
-    local dy = sp.Y - vp.Y / 2
+    local center = crosshairPos()
+    local scale = guiScale()
+    if scale <= 0 then scale = 1 end
+    local dx = (sp.X - center.X) / scale
+    local dy = (sp.Y - center.Y) / scale
     if math.abs(dx) + math.abs(dy) < 1.5 then return end
     local gain = Settings.AssistGain
     local stepX = math.clamp(dx * gain, -Settings.AssistMaxStep, Settings.AssistMaxStep)
