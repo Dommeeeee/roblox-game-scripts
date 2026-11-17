@@ -63,6 +63,7 @@ local Settings = {
     RocketAim = true,
     Trigger = false,
     TriggerKey = Enum.KeyCode.F7,
+    HeadAim = false,
 }
 
 local Power = {
@@ -162,6 +163,12 @@ local function posVisible(model, pos, camPos, ex)
 end
 
 local function visiblePoint(model, camPos, ex)
+    if Settings.HeadAim then
+        local head = model:FindFirstChild("Head")
+        if head and head:IsA("BasePart") and pointVisible(model, head, camPos, ex) then
+            return head
+        end
+    end
     for _, entry in ipairs(PART_ORDER) do
         local part = model:FindFirstChild(entry.name, true)
         if part and part:IsA("BasePart") and pointVisible(model, part, camPos, ex) then
@@ -519,8 +526,9 @@ local function autoReload(now)
     local ammo = tool:GetAttribute("Ammo")
     local mag = tool:GetAttribute("MagSize")
     if typeof(ammo) ~= "number" or typeof(mag) ~= "number" or mag <= 0 then return end
-    if now - (reloadAt[tool] or 0) < 1.1 then return end
-    if ammo <= math.max(1, math.floor(mag * Settings.ReloadAt)) then
+    if now - (reloadAt[tool] or 0) < 2.6 then return end
+    -- At zero the game's own reload runs; a second request resets the server timer.
+    if ammo >= 1 and ammo <= math.max(1, math.floor(mag * Settings.ReloadAt)) then
         reloadAt[tool] = now
         local ok = pcall(function() rel:FireServer() end)
         if ok then Power.reloads += 1 end
@@ -767,9 +775,10 @@ lockRingStroke.Parent = lockRing
 local hud = Instance.new("TextLabel")
 hud.Name = "hud"
 hud.AnchorPoint = Vector2.new(0, 0)
-hud.Position = UDim2.fromOffset(12, 8)
-hud.Size = UDim2.fromOffset(640, 54)
-hud.BackgroundTransparency = 1
+hud.Position = UDim2.new(0, 12, 0.60, 0)
+hud.Size = UDim2.fromOffset(700, 58)
+hud.BackgroundTransparency = 0.55
+hud.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 hud.Font = Enum.Font.Code
 hud.TextSize = 14
 hud.TextXAlignment = Enum.TextXAlignment.Left
@@ -942,12 +951,13 @@ local function drawHud(cam)
     for _, e in ipairs(entityCache) do
         if e.kind == "veh" then vehCount += 1 end
     end
-    hud.Text = ("AIM %s  MODE %s  RUN %s  ESP %s  FOV %d  INF %d  VEH %d%s\n%s%s")
+    hud.Text = ("AIM %s  MODE %s  RUN %s  ESP %s  FOV %d  HEAD %s  INF %d  VEH %d%s\n%s%s")
         :format(Settings.Enabled and "ON" or "OFF",
             Settings.TargetMode:upper(),
             Settings.AutoRun and "ON" or "OFF",
             Settings.ESP and "ON" or "OFF",
             Settings.FOV,
+            Settings.HeadAim and "ON" or "OFF",
             #entityCache - vehCount,
             vehCount,
             myVeh and ("  GUN V" .. tostring(myVeh.id)) or "",
@@ -1074,6 +1084,9 @@ S.connect(UserInputService.InputBegan, function(input, processed)
     elseif input.KeyCode == Enum.KeyCode.F11 then
         Settings.RocketAim = not Settings.RocketAim
         print("[UgcAim] rocket aim " .. (Settings.RocketAim and "ON" or "OFF"))
+    elseif input.KeyCode == Enum.KeyCode.H then
+        Settings.HeadAim = not Settings.HeadAim
+        print("[UgcAim] head aim " .. (Settings.HeadAim and "ON" or "OFF"))
     end
 end)
 
@@ -1138,6 +1151,7 @@ getgenv().UgcAimStatus = function()
         reloads = Power.reloads,
         trigger = Settings.Trigger,
         rocketAim = Settings.RocketAim,
+        headAim = Settings.HeadAim,
         tool = tool and tool.Name or nil,
         ammo = tool and tool:GetAttribute("Ammo") or nil,
         mag = tool and tool:GetAttribute("MagSize") or nil,
