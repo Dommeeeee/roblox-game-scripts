@@ -22,8 +22,9 @@ if getgenv().pfAimCleanup then pcall(getgenv().pfAimCleanup) end
 local Settings = {
     Enabled = true,
     Assist = true,
-    AssistGain = 1.4,
-    AssistMaxStep = 140,
+    AssistGain = 0.18,
+    AssistMaxStep = 22,
+    AssistDeadzone = 2,
     ESP = true,
     FOVCircle = true,
     FOVRadius = 200,
@@ -31,9 +32,6 @@ local Settings = {
     MaxDistance = 700,
     MaxESP = 1500,
     TeamCheck = true,
-    Lead = true,
-    BulletSpeed = 900,
-    LeadCap = 0.45,
 }
 
 local Status = {
@@ -48,6 +46,7 @@ local Status = {
     lockedKind = nil,
     lockedWall = false,
     assistFrames = 0,
+    assistSign = 1,
     view = "0,0",
     gatePx = 0,
     cTotal = 0,
@@ -341,6 +340,7 @@ end
 
 local lastResolve = 0
 local cachedTarget = nil
+local lastTargetModel = nil
 local function resolveTarget(force)
     local now = os.clock()
     if not force and cachedTarget and (now - lastResolve) < 0.05
@@ -401,6 +401,9 @@ local function resolveTarget(force)
                 local d = (sp - center).Magnitude
                 table.insert(visHits, { hit = hit, d = d })
                 local penalty = hit.kind == "torso" and 0 or 20
+                if lastTargetModel and hit.model ~= lastTargetModel then
+                    penalty = penalty + 60
+                end
                 local score = d + penalty
                 if not bestScore or score < bestScore then
                     best, bestScore, bestD = hit, score, d
@@ -424,11 +427,20 @@ local function resolveTarget(force)
 
     if not best then
         local fb, fbD = nil, nil
+        local sfb, sfbD = nil, nil
         for i = 1, math.min(#candidates, 12) do
             local c = candidates[i]
+            if lastTargetModel and c.ch.model == lastTargetModel then
+                if not sfbD or c.d < sfbD then
+                    sfb, sfbD = c.ch, c.d
+                end
+            end
             if not fbD or c.d < fbD then
                 fb, fbD = c.ch, c.d
             end
+        end
+        if sfb then
+            fb, fbD = sfb, sfbD
         end
         if fb and fbD and Settings.AutoFOV and fbD > gate and fbD <= cap then
             gate = fbD
@@ -450,32 +462,20 @@ local function resolveTarget(force)
 
     if best then
         cachedTarget = best
+        lastTargetModel = best.model
         Status.lockedModel = best.model.Name
         Status.lockedPart = best.part.Name
         Status.lockedKind = best.kind
         Status.lockedWall = best.wall == true
     else
+        cachedTarget = nil
+        lastTargetModel = nil
         Status.lockedModel = nil
         Status.lockedPart = nil
         Status.lockedKind = nil
         Status.lockedWall = false
     end
     return best
-end
-
-local function assistPoint(itarget)
-    local aim = itarget.point
-    if Settings.Lead then
-        local part = itarget.part
-        local vel = part.AssemblyLinearVelocity or part.Velocity
-        if vel and vel.Magnitude > 2 then
-            local cpos = Camera.CFrame.Position
-            local dist = (aim - cpos).Magnitude
-            local t = math.min(dist / math.max(Settings.BulletSpeed, 1), Settings.LeadCap)
-            aim = aim + vel * t
-        end
-    end
-    return aim
 end
 
 local gui = nil
@@ -721,19 +721,44 @@ connect(UIS.InputEnded, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then firing = false end
 end)
 
+local assistSign = 1
+local lastErr = nil
+local badFrames = 0
+
 local function assistStep()
-    if not (Settings.Enabled and Settings.Assist and firing) then return end
+    if not (Settings.Enabled and Settings.Assist and firing) then
+        lastErr, badFrames = nil, 0
+        return
+    end
     local target = resolveTarget(false)
     if not target or target.wall then return end
-    local sp = project(assistPoint(target))
+    local sp = project(target.point)
     if not sp then return end
     local center = screenCenter()
-    local dx = sp.X - center.X
-    local dy = sp.Y - center.Y
-    if math.abs(dx) + math.abs(dy) < 1.5 then return end
+    local dx = (sp.X - center.X) * assistSign
+    local dy = (sp.Y - center.Y) * assistSign
+    local err = math.sqrt(dx * dx + dy * dy)
+
+    if lastErr and err > lastErr * 1.25 + 8 then
+        badFrames = badFrames + 1
+    else
+        badFrames = 0
+    end
+    if badFrames >= 10 then
+        assistSign = -assistSign
+        badFrames = 0
+        lastErr = nil
+        Status.assistSign = assistSign
+        return
+    end
+    lastErr = err
+
+    local dead = Settings.AssistDeadzone or 2
+    if math.abs(dx) + math.abs(dy) < dead then return end
     local gain = Settings.AssistGain
-    local stepX = math.clamp(dx * gain, -Settings.AssistMaxStep, Settings.AssistMaxStep)
-    local stepY = math.clamp(dy * gain, -Settings.AssistMaxStep, Settings.AssistMaxStep)
+    local maxStep = Settings.AssistMaxStep
+    local stepX = math.clamp(dx * gain, -maxStep, maxStep)
+    local stepY = math.clamp(dy * gain, -maxStep, maxStep)
     pcall(mousemoverel, stepX, stepY)
     Status.assistFrames = Status.assistFrames + 1
 end
